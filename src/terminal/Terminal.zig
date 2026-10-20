@@ -1528,6 +1528,7 @@ pub fn print(self: *Terminal, c: u21) !void {
             if (!emoji) return;
         }
 
+        self.screens.active.cursorMarkDirty();
         try self.screens.active.appendGrapheme(prev, c);
         return;
     }
@@ -5825,7 +5826,7 @@ test "Terminal: VS16 doesn't make character with 2027 disabled" {
     }
 }
 
-test "Terminal: ignored VS16 doesn't mark dirty" {
+test "Terminal: stored VS16 marks dirty without widening" {
     var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
     defer t.deinit(testing.allocator);
 
@@ -5836,8 +5837,12 @@ test "Terminal: ignored VS16 doesn't mark dirty" {
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 
     t.clearDirty();
-    try t.print(0xFE0F); // VS16 to make wide
-    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try t.print(0xFE0F); // Stored even though legacy mode preserves width.
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.x);
+    const cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expectEqual(Cell.Wide.narrow, cell.cell.wide);
+    try testing.expectEqualSlices(u21, &.{0xFE0F}, cell.node.page().lookupGrapheme(cell.cell).?);
 }
 
 test "Terminal: print invalid VS16 non-grapheme" {
