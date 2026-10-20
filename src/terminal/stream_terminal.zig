@@ -3286,7 +3286,12 @@ test "full reset" {
     s.nextSlice("\x1B[5;20r"); // Set scroll region
     s.nextSlice("\x1B[?7l"); // Disable wraparound
     s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
-    try testing.expect(t.glyph_glossary.contains(0xE0A0));
+    // A build without the glyph protocol must ignore the registration. Keep
+    // the reset assertions below active in both feature configurations.
+    try testing.expectEqual(
+        build_options.glyph_protocol,
+        t.glyph_glossary.contains(0xE0A0),
+    );
 
     // Full reset
     s.nextSlice("\x1Bc");
