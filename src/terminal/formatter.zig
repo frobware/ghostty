@@ -578,6 +578,15 @@ pub const TerminalFormatter = struct {
         // Cancel a destination parser that was interrupted by a lost stream.
         // Leave the alternate screen without saving over the source's DECSC.
         try writer.writeAll("\x18\x1b[?1049l");
+        // Dynamic overrides belong to the application. Reset absent overrides
+        // to the host's configured colours rather than imposing our defaults.
+        inline for (.{ "foreground", "background", "cursor" }, 10..) |field, code| {
+            if (@field(t.colors, field).override) |rgb| {
+                try writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{ code, rgb.r, rgb.g, rgb.b });
+            } else {
+                try writer.print("\x1b]{d}\x1b\\", .{code + 100});
+            }
+        }
         // An uninitialized alternate screen means a blank screen, not that
         // an existing destination's alternate contents should survive.
         var blank = t.screens.get(.primary).?.*;
@@ -594,11 +603,24 @@ pub const TerminalFormatter = struct {
         for ([_]@import("ScreenSet.zig").Key{ .primary, .alternate }) |key| {
             const initialized = t.screens.get(key);
             const screen = initialized orelse &blank;
-            if (key == .alternate) try writer.writeAll("\x1b[?47h");
+            if (key == .alternate) {
+                // tmux keeps the 1049 return cursor separately from DECSC.
+                // Prime it from the primary save, then rebuild the primary
+                // execution state before entering without saving again. A
+                // source can mix 47/1049: its primary save need not match its
+                // current cursor, pen or origin mode.
+                try writer.writeAll("\x1b8\x1b[?1049h\x1b[?47l");
+                const primary = t.screens.get(.primary).?;
+                try self.restoreSavedCursor(primary, writer);
+                try self.restoreScreen(primary, writer);
+                try writer.writeAll("\x1b[?47h");
+            }
 
             // DECSTR leaves history intact. Establish a neutral print state
             // before formatting cells; source modes are restored afterwards.
-            try writer.writeAll("\x1b[!p\x1b]8;;\x1b\\\x1b(B\x1b)B\x0f\x1b[?7h");
+            // Some hosts (including tmux) ignore DECSTR. Explicitly establish
+            // the modes, margins and pen needed for absolute erasure/painting.
+            try writer.writeAll("\x1b[!p\x1b[?6l\x1b[?69l\x1b[r\x1b[4l\x1b[0m\x1b]8;;\x1b\\\x1b(B\x1b)B\x0f\x1b[?7h");
             for (0..t.rows) |row| {
                 // ED2 can copy the viewport into history in host terminals.
                 try writer.print("\x1b[{d};1H\x1b[2K", .{row + 1});
@@ -618,6 +640,11 @@ pub const TerminalFormatter = struct {
         }
 
         if (t.screens.active_key == .primary) try writer.writeAll("\x1b[?47l");
+
+        // Hosts with a terminal-wide DECSC register must retain the active
+        // screen's save after we have finished painting the other screen.
+        // Do this before modes/margins, which positioning the save resets.
+        try self.restoreSavedCursor(t.screens.active, writer);
 
         // Emit every ordinary mode, including defaults: the destination is
         // not necessarily fresh. Screen switches and cursor saves have already
