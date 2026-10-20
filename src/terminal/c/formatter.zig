@@ -72,6 +72,8 @@ pub const TerminalOptions = extern struct {
     /// If null, the entire screen is formatted.
     selection: ?*const CSelection = null,
 
+    restore: bool = false,
+
     /// C: GhosttyFormatterTerminalExtra
     pub const Extra = extern struct {
         size: usize = @sizeOf(Extra),
@@ -134,6 +136,8 @@ fn terminal_new_(
     OutOfMemory,
 }!*FormatterWrapper {
     const t: *ZigTerminal = (terminal_ orelse return error.InvalidValue).terminal;
+    if (opts.restore and (opts.emit != .vt or opts.selection != null))
+        return error.InvalidValue;
 
     const alloc = lib.alloc.default(alloc_);
     const ptr = alloc.create(FormatterWrapper) catch
@@ -146,6 +150,7 @@ fn terminal_new_(
         .trim = opts.trim,
     });
     formatter.extra = opts.extra.toZig();
+    formatter.restore = opts.restore;
 
     // Setup the content that we're formatting
     if (opts.selection) |sel| formatter.content = .{

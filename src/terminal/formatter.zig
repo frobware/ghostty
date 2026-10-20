@@ -274,6 +274,11 @@ pub const TerminalFormatter = struct {
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
 
+    /// Fork extension: restore both viewports and execution state to an
+    /// existing terminal. No scrollback is exported or cleared. The source
+    /// is read-only, including its active screen and parser state.
+    restore: bool = false,
+
     pub const Extra = packed struct {
         /// Emit the palette using OSC 4 sequences.
         palette: bool,
@@ -357,6 +362,7 @@ pub const TerminalFormatter = struct {
         self: TerminalFormatter,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
+        if (self.restore) return self.formatRestore(writer);
         // Emit palette before screen content if using VT format. Technically
         // we could do this after but this way if replay is slow for whatever
         // reason the colors will be right right away.
@@ -566,6 +572,185 @@ pub const TerminalFormatter = struct {
 
         try screen_formatter.format(writer);
     }
+
+    fn formatRestore(self: TerminalFormatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const t = self.terminal;
+        // Cancel a destination parser that was interrupted by a lost stream.
+        // Leave the alternate screen without saving over the source's DECSC.
+        try writer.writeAll("\x18\x1b[?1049l");
+        // An uninitialized alternate screen means a blank screen, not that
+        // an existing destination's alternate contents should survive.
+        var blank = t.screens.get(.primary).?.*;
+        var blank_pin = blank.pages.getTopLeft(.screen);
+        const blank_rac = blank_pin.rowAndCell();
+        blank.cursor = .{
+            .page_pin = &blank_pin,
+            .page_row = blank_rac.row,
+            .page_cell = blank_rac.cell,
+        };
+        blank.saved_cursor = null;
+        blank.charset = .{};
+        blank.kitty_keyboard = .{};
+        for ([_]@import("ScreenSet.zig").Key{ .primary, .alternate }) |key| {
+            const initialized = t.screens.get(key);
+            const screen = initialized orelse &blank;
+            if (key == .alternate) try writer.writeAll("\x1b[?47h");
+
+            // DECSTR leaves history intact. Establish a neutral print state
+            // before formatting cells; source modes are restored afterwards.
+            try writer.writeAll("\x1b[!p\x1b]8;;\x1b\\\x1b(B\x1b)B\x0f\x1b[?7h");
+            for (0..t.rows) |row| {
+                // ED2 can copy the viewport into history in host terminals.
+                try writer.print("\x1b[{d};1H\x1b[2K", .{row + 1});
+            }
+            try writer.writeAll("\x1b[H");
+            if (initialized != null) {
+                var content: ScreenFormatter = .init(screen, .{ .emit = .vt, .trim = false });
+                try content.format(writer);
+            } else {
+                for (1..t.rows) |_| try writer.writeAll("\r\n");
+            }
+
+            try self.restoreSavedCursor(screen, writer);
+            try self.restoreScreen(screen, writer);
+        }
+
+        if (t.screens.active_key == .primary) try writer.writeAll("\x1b[?47l");
+
+        // Emit every ordinary mode, including defaults: the destination is
+        // not necessarily fresh. Screen switches and cursor saves have already
+        // been handled, and DECCOLM must not resize/erase the destination.
+        inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
+            const mode: modespkg.Mode = @enumFromInt(field.value);
+            switch (mode) {
+                .@"132_column",
+                .alt_screen_legacy,
+                .alt_screen,
+                .alt_screen_save_cursor_clear_enter,
+                .save_cursor,
+                => {},
+                else => {
+                    const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
+                    try writer.print("\x1b[{s}{d}{s}", .{
+                        if (tag.ansi) "" else "?",
+                        tag.value,
+                        if (t.modes.get(mode)) "h" else "l",
+                    });
+                },
+            }
+        }
+
+        // Reuse the regular formatter for terminal-wide extras, but never
+        // print cells or switch screens after their viewports are restored.
+        var extras = self;
+        extras.restore = false;
+        extras.content = .none;
+        extras.pin_map = null;
+        extras.extra = .all;
+        extras.extra.modes = false;
+        extras.extra.screen = .none;
+        // Tabstop positioning must be absolute, even when DECOM was set.
+        try writer.writeAll("\x1b[?6l");
+        try extras.format(writer);
+        try writer.print("\x1b[>4;{d}m", .{@as(u8, if (t.flags.modify_other_keys_2) 2 else 0)});
+        try self.restoreScreen(t.screens.active, writer);
+    }
+
+    fn restoreSavedCursor(self: TerminalFormatter, screen: *const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const saved = screen.saved_cursor orelse Screen.SavedCursor{
+            .x = 0,
+            .y = 0,
+            .style = .{},
+            .protected = false,
+            .pending_wrap = false,
+            .origin = false,
+            .charset = .{},
+        };
+        // A borrowed view, never deinitialized or mutated through its owned
+        // pointers. The cursor's page references must match the saved position.
+        var view = screen.*;
+        var pin = screen.pages.pin(.{ .screen = .{
+            .x = @min(saved.x, self.terminal.cols - 1),
+            .y = @min(saved.y, self.terminal.rows - 1),
+        } }).?;
+        const rac = pin.rowAndCell();
+        view.cursor.x = pin.x;
+        view.cursor.y = @min(saved.y, self.terminal.rows - 1);
+        view.cursor.style = saved.style;
+        view.cursor.protected = saved.protected;
+        view.cursor.pending_wrap = saved.pending_wrap;
+        view.cursor.page_pin = &pin;
+        view.cursor.page_row = rac.row;
+        view.cursor.page_cell = rac.cell;
+        view.charset = saved.charset;
+        try writer.writeAll("\x1b[?6l\x1b[?69l\x1b[r");
+        if (saved.origin) try writer.writeAll("\x1b[?6h");
+        var formatter: ScreenFormatter = .init(&view, .vt);
+        formatter.content = .none;
+        formatter.extra = .all;
+        formatter.explicit_defaults = true;
+        formatter.extra.kitty_keyboard = false;
+        try formatter.format(writer);
+        try writer.writeAll("\x1b7\x1b[?6l");
+    }
+
+    fn restoreScreen(self: TerminalFormatter, screen: *const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        // Reset state that the normal formatter omits when it is at defaults.
+        try writer.writeAll("\x1b[0m\x1b]8;;\x1b\\\x1b[0\"q\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}");
+        try writer.writeAll("\x1b[<8u");
+        const stack = &screen.kitty_keyboard;
+        for (0..stack.flags.len) |i| {
+            const idx = stack.idx +% @as(u3, @truncate(i + 1));
+            try writer.print("\x1b[>{d}u", .{stack.flags[idx].int()});
+        }
+        const cursor_shape: u8 = switch (screen.cursor.cursor_style) {
+            .block, .block_hollow => 2,
+            .underline => 4,
+            .bar => 6,
+        };
+        try writer.print("\x1b[{d} q", .{
+            cursor_shape - @as(u8, if (self.terminal.modes.get(.cursor_blinking)) 1 else 0),
+        });
+        var formatter: ScreenFormatter = .init(screen, .vt);
+        formatter.content = .none;
+        formatter.extra = .all;
+        formatter.explicit_defaults = true;
+        // Origin mode is global and must be restored after painting.
+        if (self.terminal.modes.get(.origin)) {
+            try writer.print("\x1b[{d};{d}r\x1b[?6h", .{
+                self.terminal.scrolling_region.top + 1,
+                self.terminal.scrolling_region.bottom + 1,
+            });
+            formatter.cursor_origin = .{
+                .x = self.terminal.scrolling_region.left,
+                .y = self.terminal.scrolling_region.top,
+            };
+        }
+        try formatter.format(writer);
+        // Restoring a wrap over an erased cell uses DECSC/DECRC. In this
+        // reachable VT state the saved cursor has the same position/wrap,
+        // but its pen may differ from the current pen. Restore that register
+        // without moving the cursor (which would discard pending wrap).
+        if (screen.cursor.pending_wrap and
+            !screen.cursor.page_cell.hasText() and
+            screen.saved_cursor != null)
+        {
+            const saved = screen.saved_cursor.?;
+            var view = screen.*;
+            view.cursor.style = saved.style;
+            view.cursor.protected = saved.protected;
+            view.charset = saved.charset;
+            var saved_formatter = formatter;
+            saved_formatter.screen = &view;
+            saved_formatter.extra.cursor = false;
+            saved_formatter.extra.kitty_keyboard = false;
+            try saved_formatter.format(writer);
+            try writer.writeAll("\x1b7");
+            formatter.extra.cursor = false;
+            formatter.extra.kitty_keyboard = false;
+            try formatter.format(writer);
+        }
+    }
 };
 
 /// Screen formatter formats a single terminal screen (e.g. primary vs alt).
@@ -599,6 +784,9 @@ pub const ScreenFormatter = struct {
     /// top-left of the screen unless the output is replayed in origin mode
     /// (DECOM), where CUP counts from the top-left of the scrolling region.
     cursor_origin: CursorOrigin = .{},
+
+    /// Emit defaults too when reconstructing state in an existing terminal.
+    explicit_defaults: bool = false,
 
     pub const Content = union(enum) {
         /// Emit no content, only terminal state such as modes, palette, etc.
@@ -730,7 +918,7 @@ pub const ScreenFormatter = struct {
             const origin = self.cursor_origin;
 
             // If we don't have pending wrap, then we can just use CUP.
-            if (!cursor.pending_wrap or cursor.x != self.screen.pages.cols - 1) {
+            if (!cursor.pending_wrap) {
                 try writer.print("\x1b[{d};{d}H", .{
                     (cursor.y -| origin.y) + 1,
                     (cursor.x -| origin.x) + 1,
@@ -784,6 +972,8 @@ pub const ScreenFormatter = struct {
         // Emit current hyperlink state using OSC 8
         if (self.extra.hyperlink) {
             const cursor = &self.screen.cursor;
+            if (cursor.hyperlink == null and self.explicit_defaults)
+                try writer.writeAll("\x1b]8;;\x1b\\");
             if (cursor.hyperlink) |link| {
                 // Start hyperlink with uri (and explicit id if present)
                 switch (link.id) {
@@ -802,6 +992,8 @@ pub const ScreenFormatter = struct {
         // Emit character protection mode using DECSCA
         if (self.extra.protection) {
             const cursor = &self.screen.cursor;
+            if (!cursor.protected and self.explicit_defaults)
+                try writer.writeAll("\x1b[0\"q");
             if (cursor.protected) {
                 // DEC protected mode
                 try writer.print("\x1b[1\"q", .{});
@@ -824,7 +1016,7 @@ pub const ScreenFormatter = struct {
             // Emit G0-G3 designations
             for (std.enums.values(charsets.Slots)) |slot| {
                 const cs = charset.charsets.get(slot);
-                if (cs != .utf8) { // Only emit non-default charsets
+                if (cs != .utf8 or self.explicit_defaults) {
                     const intermediate: u8 = switch (slot) {
                         .G0 => '(',
                         .G1 => ')',
@@ -832,16 +1024,16 @@ pub const ScreenFormatter = struct {
                         .G3 => '+',
                     };
                     const final: u8 = switch (cs) {
-                        .ascii => 'B',
+                        .utf8, .ascii => 'B',
                         .british => 'A',
                         .dec_special => '0',
-                        else => continue,
                     };
                     try writer.print("\x1b{c}{c}", .{ intermediate, final });
                 }
             }
 
             // Emit GL invocation if not G0
+            if (charset.gl == .G0 and self.explicit_defaults) try writer.writeAll("\x0f");
             if (charset.gl != .G0) {
                 const seq = switch (charset.gl) {
                     .G0 => unreachable,
@@ -853,6 +1045,7 @@ pub const ScreenFormatter = struct {
             }
 
             // Emit GR invocation if not G2
+            if (charset.gr == .G2 and self.explicit_defaults) try writer.writeAll("\x1b}");
             if (charset.gr != .G2) {
                 const seq = switch (charset.gr) {
                     .G0 => unreachable, // GR can't be G0
@@ -861,6 +1054,16 @@ pub const ScreenFormatter = struct {
                     .G3 => "\x1b|", // LS3R
                 };
                 try writer.print("{s}", .{seq});
+            }
+        }
+
+        if (self.extra.charsets and self.explicit_defaults) {
+            if (self.screen.charset.single_shift) |slot| {
+                try writer.writeAll(switch (slot) {
+                    .G2 => "\x1bN",
+                    .G3 => "\x1bO",
+                    else => unreachable,
+                });
             }
         }
 

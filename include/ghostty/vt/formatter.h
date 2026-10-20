@@ -120,6 +120,14 @@ typedef struct {
   /** Optional selection to restrict output to a range.
    *  If NULL, the entire screen is formatted. */
   const GhosttySelection *selection;
+
+  /**
+   * Emit a VT restoration of both screen viewports, their saved cursors,
+   * and execution state. Requires VT output and no selection. The destination
+   * must have the same geometry. Scrollback is neither exported nor cleared.
+   * This is an rty fork extension; false preserves upstream formatting.
+   */
+  bool restore;
 } GhosttyFormatterTerminalOptions;
 
 /**
