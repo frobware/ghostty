@@ -605,7 +605,9 @@ pub const TerminalFormatter = struct {
             }
             try writer.writeAll("\x1b[H");
             if (initialized != null) {
-                var content: ScreenFormatter = .init(screen, .{ .emit = .vt, .trim = false });
+                // Let soft-wrapped rows wrap naturally instead of inserting
+                // hard newlines, which would change their reflow identity.
+                var content: ScreenFormatter = .init(screen, .{ .emit = .vt, .trim = false, .unwrap = true });
                 try content.format(writer);
             } else {
                 for (1..t.rows) |_| try writer.writeAll("\r\n");
