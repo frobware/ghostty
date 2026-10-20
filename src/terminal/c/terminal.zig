@@ -1966,6 +1966,9 @@ pub const TerminalData = enum(c_int) {
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
     memory_usage = 42,
+    modify_other_keys_state_2 = 43,
+    mouse_tracking_mode = 44,
+    mouse_format = 45,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1979,8 +1982,11 @@ pub const TerminalData = enum(c_int) {
             .vt_processing_error,
             .vt_ground,
             .cursor_at_prompt,
+            .modify_other_keys_state_2,
             => bool,
             .mouse_shape => mouse.Shape,
+            .mouse_tracking_mode => mouse.Event,
+            .mouse_format => mouse.Format,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
@@ -2076,6 +2082,9 @@ fn getTyped(
         .cursor_pending_wrap => out.* = t.screens.active.cursor.pending_wrap,
         .active_screen => out.* = t.screens.active_key,
         .cursor_visible => out.* = t.modes.get(.cursor_visible),
+        .modify_other_keys_state_2 => out.* = t.flags.modify_other_keys_2,
+        .mouse_tracking_mode => out.* = t.flags.mouse_event,
+        .mouse_format => out.* = t.flags.mouse_format,
         .kitty_keyboard_flags => out.* = @as(u8, t.screens.active.kitty_keyboard.current().int()),
         .scrollbar => out.* = t.screens.active.pages.scrollbar().cval(),
         .cursor_style => out.* = .fromStyle(t.screens.active.cursor.style),
@@ -7910,4 +7919,38 @@ test "get mouse_shape" {
     vt_write(t, "\x07", 1);
     try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
     try testing.expectEqual(mouse.Shape.wait, shape);
+}
+
+test "input state getters follow active protocols" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 6));
+    defer free(t);
+
+    var modify = true;
+    var tracking: mouse.Event = .any;
+    var format: mouse.Format = .sgr;
+    try testing.expectEqual(Result.success, get(t, .modify_other_keys_state_2, @ptrCast(&modify)));
+    try testing.expectEqual(Result.success, get(t, .mouse_tracking_mode, @ptrCast(&tracking)));
+    try testing.expectEqual(Result.success, get(t, .mouse_format, @ptrCast(&format)));
+    try testing.expect(!modify);
+    try testing.expectEqual(mouse.Event.none, tracking);
+    try testing.expectEqual(mouse.Format.x10, format);
+
+    const enable = "\x1b[>4;2m\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1005h";
+    vt_write(t, enable.ptr, enable.len);
+    try testing.expectEqual(Result.success, get(t, .modify_other_keys_state_2, @ptrCast(&modify)));
+    try testing.expectEqual(Result.success, get(t, .mouse_tracking_mode, @ptrCast(&tracking)));
+    try testing.expectEqual(Result.success, get(t, .mouse_format, @ptrCast(&format)));
+    try testing.expect(modify);
+    try testing.expectEqual(mouse.Event.any, tracking);
+    try testing.expectEqual(mouse.Format.utf8, format);
+
+    const reset_sequence = "\x1bc";
+    vt_write(t, reset_sequence.ptr, reset_sequence.len);
+    try testing.expectEqual(Result.success, get(t, .modify_other_keys_state_2, @ptrCast(&modify)));
+    try testing.expectEqual(Result.success, get(t, .mouse_tracking_mode, @ptrCast(&tracking)));
+    try testing.expectEqual(Result.success, get(t, .mouse_format, @ptrCast(&format)));
+    try testing.expect(!modify);
+    try testing.expectEqual(mouse.Event.none, tracking);
+    try testing.expectEqual(mouse.Format.x10, format);
 }
