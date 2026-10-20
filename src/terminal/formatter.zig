@@ -590,7 +590,7 @@ pub const TerminalFormatter = struct {
         // An uninitialized alternate screen means a blank screen, not that
         // an existing destination's alternate contents should survive.
         var blank = t.screens.get(.primary).?.*;
-        var blank_pin = blank.pages.getTopLeft(.screen);
+        var blank_pin = blank.pages.getTopLeft(.active);
         const blank_rac = blank_pin.rowAndCell();
         blank.cursor = .{
             .page_pin = &blank_pin,
@@ -630,10 +630,19 @@ pub const TerminalFormatter = struct {
                 // Let soft-wrapped rows wrap naturally instead of inserting
                 // hard newlines, which would change their reflow identity.
                 var content: ScreenFormatter = .init(screen, .{ .emit = .vt, .trim = false, .unwrap = true });
+                // The default selection includes scrollback. A recovery is
+                // only the active viewport, also when resize created history.
+                content.content = .{ .selection = .init(
+                    screen.pages.getTopLeft(.active),
+                    screen.pages.getBottomRight(.active).?,
+                    false,
+                ) };
                 try content.format(writer);
             } else {
                 for (1..t.rows) |_| try writer.writeAll("\r\n");
             }
+            try self.restoreBlankCells(initialized, writer);
+            if (initialized) |s| try self.restoreRowWraps(s, writer);
 
             try self.restoreSavedCursor(screen, writer);
             try self.restoreScreen(screen, writer);
@@ -685,6 +694,72 @@ pub const TerminalFormatter = struct {
         try self.restoreScreen(t.screens.active, writer);
     }
 
+    fn restoreBlankCells(self: TerminalFormatter, screen_: ?*const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        // Unwrapping can materialize padding as spaces, notably when growing
+        // the non-reflowing alternate screen. Erase it back to empty cells.
+        // ECH resets row.wrap, so rebuild soft boundaries afterwards.
+        try writer.writeAll("\x1b[0m");
+        // Treat an uninitialized screen exactly like an initialized blank
+        // one, so restoring and exporting again has the same baseline.
+        const screen = screen_ orelse {
+            for (0..self.terminal.rows) |y| {
+                try writer.print("\x1b[{d};1H\x1b[{d}X", .{ y + 1, self.terminal.cols });
+            }
+            return;
+        };
+        for (0..self.terminal.rows) |y| {
+            const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y) } }).?;
+            const cells = pin.node.page().getCells(pin.rowAndCell().row)[0..self.terminal.cols];
+            var x: usize = 0;
+            while (x < cells.len) {
+                if (!cells[x].isEmpty() or cells[x].wide != .narrow) {
+                    x += 1;
+                    continue;
+                }
+                const start = x;
+                while (x < cells.len and cells[x].isEmpty() and cells[x].wide == .narrow) : (x += 1) {}
+                try writer.print("\x1b[{d};{d}H\x1b[{d}X", .{ y + 1, start + 1, x - start });
+            }
+        }
+    }
+
+    fn restoreRowWraps(self: TerminalFormatter, screen: *const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        // Reflow can leave a wrapped row followed by an empty continuation.
+        // Recreate boundaries from top to bottom, after padding erasure, so
+        // neither CR/LF nor ECH can discard the source's reflow identity.
+        for (0..self.terminal.rows - 1) |y| {
+            var pin = screen.pages.pin(.{ .active = .{
+                .x = self.terminal.cols - 1,
+                .y = @intCast(y),
+            } }).?;
+            const rac = pin.rowAndCell();
+            if (!rac.row.wrap) continue;
+            var view = screen.*;
+            view.cursor.x = pin.x;
+            view.cursor.y = @intCast(y);
+            view.cursor.page_pin = &pin;
+            view.cursor.page_row = rac.row;
+            view.cursor.page_cell = rac.cell;
+            // A wide character at the next row created a wrap spacer. Start
+            // in its empty last column so printing that character recreates it.
+            view.cursor.pending_wrap = rac.cell.wide != .spacer_head;
+            var cursor: ScreenFormatter = .init(&view, .vt);
+            cursor.content = .none;
+            cursor.extra.cursor = true;
+            try cursor.format(writer);
+            try writer.writeAll("\x1b[0m");
+            const next = screen.pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y + 1) } }).?;
+            if (!next.rowAndCell().cell.hasText()) {
+                try writer.writeAll(" \r\x1b[X");
+            }
+            var cell: PageFormatter = .init(next.node.page(), .vt);
+            cell.start_y = next.y;
+            cell.end_y = next.y;
+            cell.end_x = 0;
+            try cell.format(writer);
+        }
+    }
+
     fn restoreSavedCursor(self: TerminalFormatter, screen: *const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const saved = screen.saved_cursor orelse Screen.SavedCursor{
             .x = 0,
@@ -698,7 +773,7 @@ pub const TerminalFormatter = struct {
         // A borrowed view, never deinitialized or mutated through its owned
         // pointers. The cursor's page references must match the saved position.
         var view = screen.*;
-        var pin = screen.pages.pin(.{ .screen = .{
+        var pin = screen.pages.pin(.{ .active = .{
             .x = @min(saved.x, self.terminal.cols - 1),
             .y = @min(saved.y, self.terminal.rows - 1),
         } }).?;
@@ -8431,5 +8506,59 @@ test "Page HTML hyperlink point map maps closing to previous cell" {
     const expected_coord = point_map.items[closing_idx - 1];
     for (closing_idx..closing_idx + "</a>".len) |i| {
         try testing.expectEqual(expected_coord, point_map.items[i]);
+    }
+}
+
+test "Terminal restoration preserves resized viewport and continuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    const Case = struct { before: []const u8, after: []const u8, grow: bool };
+    const cases = [_]Case{
+        .{ .before = "abcdefghijklmnopqrstuvwxyz0123456789", .after = "!", .grow = false },
+        .{ .before = "shell\x1b[?1049habcdefghijklmnopqrstuvwxyz0123456789", .after = "!\x1b[?1049l!", .grow = true },
+        .{ .before = "HISTORY0\r\nHISTORY1\r\nHISTORY2\r\nHISTORY3\r\nHISTORY4\r\nHISTORY5\r\nshell\x1b[2;8H\x1b[31m\x1b7\x1b[Hnow", .after = "\x1b8!", .grow = false },
+    };
+    for (cases) |case| {
+        var source = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 6, .max_scrollback_bytes = 1_000_000 });
+        defer source.deinit(alloc);
+        var input = source.vtStream();
+        defer input.deinit();
+        input.nextSlice(case.before);
+        try source.resize(alloc, .{ .cols = 12, .rows = 4 });
+        if (case.grow) try source.resize(alloc, .{ .cols = 28, .rows = 9 });
+        var buffer: std.Io.Writer.Allocating = .init(alloc);
+        defer buffer.deinit();
+        var formatter: TerminalFormatter = .init(&source, .vt);
+        formatter.restore = true;
+        try formatter.format(&buffer.writer);
+        try testing.expect(std.mem.indexOf(u8, buffer.writer.buffered(), "HISTORY0") == null);
+        var destination = try Terminal.init(io, alloc, .{ .cols = source.cols, .rows = source.rows });
+        defer destination.deinit(alloc);
+        var output = destination.vtStream();
+        defer output.deinit();
+        output.nextSlice(buffer.writer.buffered());
+        for ([_][]const u8{ "", case.after }) |continuation| {
+            input.nextSlice(continuation);
+            output.nextSlice(continuation);
+            try testing.expectEqual(source.screens.active_key, destination.screens.active_key);
+            try testing.expectEqual(source.screens.active.cursor.x, destination.screens.active.cursor.x);
+            try testing.expectEqual(source.screens.active.cursor.y, destination.screens.active.cursor.y);
+            try testing.expectEqual(source.screens.active.cursor.pending_wrap, destination.screens.active.cursor.pending_wrap);
+            for (0..source.rows) |y| {
+                const a_row = source.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y) } }).?.rowAndCell().row;
+                const b_row = destination.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y) } }).?.rowAndCell().row;
+                try testing.expectEqual(a_row.wrap, b_row.wrap);
+                for (0..source.cols) |x| {
+                    const pt: @import("point.zig").Point = .{ .active = .{ .x = @intCast(x), .y = @intCast(y) } };
+                    const a = source.screens.active.pages.getCell(pt).?;
+                    const b = destination.screens.active.pages.getCell(pt).?;
+                    try testing.expectEqual(a.cell.content_tag, b.cell.content_tag);
+                    try testing.expectEqual(a.cell.codepoint(), b.cell.codepoint());
+                    try testing.expectEqual(a.cell.wide, b.cell.wide);
+                    try testing.expect(a.style().eql(b.style()));
+                }
+            }
+        }
     }
 }
