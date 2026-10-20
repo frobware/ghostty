@@ -601,8 +601,6 @@ pub const TerminalFormatter = struct {
         blank.charset = .{};
         blank.kitty_keyboard = .{};
         for ([_]@import("ScreenSet.zig").Key{ .primary, .alternate }) |key| {
-            const initialized = t.screens.get(key);
-            const screen = initialized orelse &blank;
             if (key == .alternate) {
                 // tmux keeps the 1049 return cursor separately from DECSC.
                 // Prime it from the primary save, then rebuild the primary
@@ -616,39 +614,21 @@ pub const TerminalFormatter = struct {
                 try writer.writeAll("\x1b[?47h");
             }
 
-            // DECSTR leaves history intact. Establish a neutral print state
-            // before formatting cells; source modes are restored afterwards.
-            // Some hosts (including tmux) ignore DECSTR. Explicitly establish
-            // the modes, margins and pen needed for absolute erasure/painting.
-            try writer.writeAll("\x1b[!p\x1b[?6l\x1b[?69l\x1b[r\x1b[4l\x1b[0m\x1b]8;;\x1b\\\x1b(B\x1b)B\x0f\x1b[?7h");
-            for (0..t.rows) |row| {
-                // ED2 can copy the viewport into history in host terminals.
-                try writer.print("\x1b[{d};1H\x1b[2K", .{row + 1});
-            }
-            try writer.writeAll("\x1b[H");
-            if (initialized != null) {
-                // Let soft-wrapped rows wrap naturally instead of inserting
-                // hard newlines, which would change their reflow identity.
-                var content: ScreenFormatter = .init(screen, .{ .emit = .vt, .trim = false, .unwrap = true });
-                // The default selection includes scrollback. A recovery is
-                // only the active viewport, also when resize created history.
-                content.content = .{ .selection = .init(
-                    screen.pages.getTopLeft(.active),
-                    screen.pages.getBottomRight(.active).?,
-                    false,
-                ) };
-                try content.format(writer);
-            } else {
-                for (1..t.rows) |_| try writer.writeAll("\r\n");
-            }
-            try self.restoreBlankCells(initialized, writer);
-            if (initialized) |s| try self.restoreRowWraps(s, writer);
-
+            const initialized = t.screens.get(key);
+            const screen = initialized orelse &blank;
+            try self.restoreViewport(initialized, writer);
             try self.restoreSavedCursor(screen, writer);
             try self.restoreScreen(screen, writer);
         }
 
-        if (t.screens.active_key == .primary) try writer.writeAll("\x1b[?47l");
+        if (t.screens.active_key == .primary) {
+            // Alacritty ignores 47 and remains in the alternate buffer. Leave
+            // through 1049, then repaint the primary viewport: on that host,
+            // the earlier primary-state rebuild was applied to the alternate.
+            // Repainting is also safe on hosts implementing both switches.
+            try writer.writeAll("\x1b[?1049l");
+            try self.restoreViewport(t.screens.get(.primary), writer);
+        }
 
         // Hosts with a terminal-wide DECSC register must retain the active
         // screen's save after we have finished painting the other screen.
@@ -694,6 +674,39 @@ pub const TerminalFormatter = struct {
         try self.restoreScreen(t.screens.active, writer);
     }
 
+    fn restoreViewport(self: TerminalFormatter, initialized: ?*const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const t = self.terminal;
+        // DECSTR invalidates both saved cursors in Kitty, including the
+        // primary save established before painting the alternate viewport.
+        // Establish print state explicitly without resetting saved state.
+        try writer.writeAll("\x1b[?6l\x1b[?69l\x1b[r\x1b[4l\x1b[0m\x1b]8;;\x1b\\\x1b(B\x1b)B\x0f\x1b[?7h");
+        // A one-shot charset can survive a screen switch. Consume it before
+        // erasing; an empty viewport would otherwise save that pending shift.
+        try writer.writeAll("\x1b[H ");
+        for (0..t.rows) |row| {
+            // ED2 can copy the viewport into history in host terminals.
+            try writer.print("\x1b[{d};1H\x1b[2K", .{row + 1});
+        }
+        try writer.writeAll("\x1b[H");
+        if (initialized) |screen| {
+            // Let soft-wrapped rows wrap naturally instead of inserting
+            // hard newlines, which would change their reflow identity.
+            var content: ScreenFormatter = .init(screen, .{ .emit = .vt, .trim = false, .unwrap = true });
+            // The default selection includes scrollback. A recovery is
+            // only the active viewport, also when resize created history.
+            content.content = .{ .selection = .init(
+                screen.pages.getTopLeft(.active),
+                screen.pages.getBottomRight(.active).?,
+                false,
+            ) };
+            try content.format(writer);
+        } else {
+            for (1..t.rows) |_| try writer.writeAll("\r\n");
+        }
+        try self.restoreBlankCells(initialized, writer);
+        if (initialized) |screen| try self.restoreRowWraps(screen, writer);
+    }
+
     fn restoreBlankCells(self: TerminalFormatter, screen_: ?*const Screen, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         // Unwrapping can materialize padding as spaces, notably when growing
         // the non-reflowing alternate screen. Erase it back to empty cells.
@@ -734,6 +747,14 @@ pub const TerminalFormatter = struct {
             } }).?;
             const rac = pin.rowAndCell();
             if (!rac.row.wrap) continue;
+            const next = screen.pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y + 1) } }).?;
+            if (next.rowAndCell().cell.wide == .wide) {
+                // Alacritty clears a preceding wide-wrap spacer when replacing
+                // an existing wide cell at the start of the next row. Erase
+                // that pair first, then recreate the wrap and glyph together.
+                // Work top-to-bottom so ECH's row-wrap reset is repaired next.
+                try writer.print("\x1b[{d};1H\x1b[0m\x1b[2X", .{y + 2});
+            }
             var view = screen.*;
             view.cursor.x = pin.x;
             view.cursor.y = @intCast(y);
@@ -748,7 +769,6 @@ pub const TerminalFormatter = struct {
             cursor.extra.cursor = true;
             try cursor.format(writer);
             try writer.writeAll("\x1b[0m");
-            const next = screen.pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y + 1) } }).?;
             if (!next.rowAndCell().cell.hasText()) {
                 try writer.writeAll(" \r\x1b[X");
             }
