@@ -2965,6 +2965,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalMemoryUsage *
    */
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
+
+  /** Whether xterm modifyOtherKeys state 2 is active. Output type: bool *. */
+  GHOSTTY_TERMINAL_DATA_MODIFY_OTHER_KEYS_STATE_2 = 43,
+
+  /**
+   * Effective mouse tracking mode used by the mouse encoder. Unlike querying
+   * individual mode bits, this accounts for the order of mode transitions.
+   * Output type: GhosttyMouseTrackingMode * (see mouse/encoder.h).
+   */
+  GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING_MODE = 44,
+
+  /**
+   * Effective mouse format used by the mouse encoder.
+   * Output type: GhosttyMouseFormat * (see mouse/encoder.h).
+   */
+  GHOSTTY_TERMINAL_DATA_MOUSE_FORMAT = 45,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
