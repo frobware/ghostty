@@ -3488,6 +3488,32 @@ test "grapheme" {
     }
 }
 
+test "zero-width grapheme invalidates a previously captured row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+    t.modes.set(.grapheme_cluster, false);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    stream.nextSlice("e");
+    try state.update(alloc, &t);
+    state.clean();
+    stream.nextSlice("\u{0301}");
+    try state.update(alloc, &t);
+    try testing.expectEqual(.partial, state.dirty);
+    const rows = state.row_data.slice();
+    try testing.expect(rows.items(.dirty)[0]);
+    try testing.expect(!rows.items(.dirty)[1]);
+    try testing.expectEqualSlices(u21, &.{0x0301}, rows.items(.cells)[0].get(0).grapheme);
+}
+
 test "cursor state in viewport" {
     const testing = std.testing;
     const alloc = testing.allocator;
