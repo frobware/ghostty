@@ -1503,6 +1503,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * buffer size in bytes.
    */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8 = 9,
+  /** Hyperlink URI (GhosttyString). Empty when this cell has no hyperlink.
+   *  Borrowed until the terminal is mutated or the render state is updated. */
+  GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HYPERLINK_URI = 10,
+
+  /** Explicit OSC 8 grouping identifier (GhosttyString). Empty when no ID was
+   *  supplied. Same borrowed lifetime as HYPERLINK_URI. */
+  GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HYPERLINK_ID = 11,
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowCellsData;
 
