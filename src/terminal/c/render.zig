@@ -86,6 +86,7 @@ const RowCellsWrapper = struct {
     /// `position_none` if iteration hasn't started. Always validate
     /// against `raws.len` before use.
     x: usize,
+    pin: PageList.Pin,
 
     raws: []const page.Cell,
     graphemes: []const []const u21,
@@ -698,6 +699,7 @@ pub fn row_cells_new(
     ptr.* = .{
         .alloc = alloc,
         .x = undefined,
+        .pin = undefined,
         .raws = undefined,
         .graphemes = undefined,
         .styles = undefined,
@@ -742,6 +744,8 @@ pub const RowCellsData = enum(c_int) {
     selected = 7,
     has_styling = 8,
     graphemes_utf8 = 9,
+    hyperlink_uri = 10,
+    hyperlink_id = 11,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: RowCellsData) type {
@@ -754,6 +758,7 @@ pub const RowCellsData = enum(c_int) {
             .bg_color, .fg_color => colorpkg.RGB.C,
             .selected, .has_styling => bool,
             .graphemes_utf8 => lib.Buffer,
+            .hyperlink_uri, .hyperlink_id => lib.String,
         };
     }
 };
@@ -897,6 +902,21 @@ fn rowCellsGetTypedInner(
             x >= sel[0] and x <= sel[1]
         else
             false,
+        .hyperlink_uri, .hyperlink_id => {
+            out.* = .{ .ptr = "".ptr, .len = 0 };
+            if (!cell.hyperlink) return .success;
+            const p = cells.pin.node.page();
+            const source = p.getRowAndCell(@intCast(x), cells.pin.y).cell;
+            const id = p.lookupHyperlink(source) orelse return .invalid_value;
+            const entry = p.hyperlink_set.get(p.memory, id);
+            const bytes = if (data == .hyperlink_uri)
+                entry.uri.slice(p.memory)
+            else switch (entry.id) {
+                .explicit => |value| value.slice(p.memory),
+                .implicit => return .success,
+            };
+            out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+        },
         .has_styling => out.* = cell.hasStyling(),
         .graphemes_utf8 => return rowCellsGetGraphemesUtf8(cell, if (cell.hasGrapheme()) cells.graphemes[x] else &.{}, out),
     }
@@ -1080,6 +1100,7 @@ fn rowGetTyped(
             cells.* = .{
                 .alloc = cells.alloc,
                 .x = position_none,
+                .pin = it.pins[y],
                 .raws = cell_data.items(.raw),
                 .graphemes = cell_data.items(.grapheme),
                 .styles = cell_data.items(.style),
@@ -3075,4 +3096,34 @@ test "render: overscan get_multi and row_get_multi" {
     try testing.expectEqual(row_keys.len, written);
     try testing.expectEqual(@as(i32, -1), vy);
     try testing.expect(!std.meta.eql(id, RowId{}));
+}
+
+test "render: hyperlink metadata" {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &terminal, 10, 3));
+    defer terminal_c.free(terminal);
+    const bytes = "N\x1b]8;id=docs;https://example.org\x1b\\L\x1b]8;;\x1b\\\x1b]8;;https://example.org/implicit\x07I\x1b]8;;\x07";
+    terminal_c.vt_write(terminal, bytes, bytes.len);
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &state));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(&lib.alloc.test_allocator, &it));
+    defer row_iterator_free(it);
+    var cells: RowCells = null;
+    try testing.expectEqual(Result.success, row_cells_new(&lib.alloc.test_allocator, &cells));
+    defer row_cells_free(cells);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+    try testing.expect(row_iterator_next(it));
+    try testing.expectEqual(Result.success, row_get(it, .cells, @ptrCast(&cells)));
+    for ([_][]const u8{ "", "https://example.org", "https://example.org/implicit" }, 0..) |expected, x| {
+        try testing.expectEqual(Result.success, row_cells_select(cells, @intCast(x)));
+        var uri: lib.String = undefined;
+        var id: lib.String = undefined;
+        try testing.expectEqual(Result.success, row_cells_get(cells, .hyperlink_uri, @ptrCast(&uri)));
+        try testing.expectEqual(Result.success, row_cells_get(cells, .hyperlink_id, @ptrCast(&id)));
+        try testing.expectEqualStrings(expected, uri.ptr[0..uri.len]);
+        try testing.expectEqualStrings(if (x == 1) "docs" else "", id.ptr[0..id.len]);
+    }
 }
