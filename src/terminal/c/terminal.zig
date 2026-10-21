@@ -1866,6 +1866,7 @@ pub const TerminalData = enum(c_int) {
     modify_other_keys_state_2 = 43,
     mouse_tracking_mode = 44,
     mouse_format = 45,
+    color_palette_overrides = 46,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1905,6 +1906,7 @@ pub const TerminalData = enum(c_int) {
             .color_cursor_default,
             => color.RGB.C,
             .color_palette, .color_palette_default => color.PaletteC,
+            .color_palette_overrides => [256]bool,
             .kitty_image_storage_limit => u64,
             .kitty_image_medium_file,
             .kitty_image_medium_shared_mem,
@@ -2010,6 +2012,9 @@ fn getTyped(
         .color_cursor_default => out.* = (t.colors.cursor.default orelse return .no_value).cval(),
         .color_palette => out.* = color.paletteCval(&t.colors.palette.current),
         .color_palette_default => out.* = color.paletteCval(t.colors.palette.original),
+        .color_palette_overrides => {
+            for (out, 0..) |*entry, i| entry.* = t.colors.palette.mask.isSet(i);
+        },
         .kitty_image_storage_limit => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.total_limit);
@@ -7261,6 +7266,26 @@ test "get color default returns no_value when unset" {
     try testing.expectEqual(Result.no_value, get(t, .color_foreground_default, @ptrCast(&rgb)));
     try testing.expectEqual(Result.no_value, get(t, .color_background_default, @ptrCast(&rgb)));
     try testing.expectEqual(Result.no_value, get(t, .color_cursor_default, @ptrCast(&rgb)));
+}
+
+test "get color palette overrides distinguishes explicit defaults and reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(null, &t, 10, 4));
+    defer free(t);
+
+    var overrides: [256]bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .color_palette_overrides, @ptrCast(&overrides)));
+    for (overrides) |entry| try testing.expect(!entry);
+
+    const sequence = "\x1b]4;2;#b5bd68\x1b\\";
+    vt_write(t, sequence.ptr, sequence.len);
+    try testing.expectEqual(Result.success, get(t, .color_palette_overrides, @ptrCast(&overrides)));
+    for (overrides, 0..) |entry, i| try testing.expectEqual(i == 2, entry);
+
+    const restore = "\x1b]104;2\x1b\\";
+    vt_write(t, restore.ptr, restore.len);
+    try testing.expectEqual(Result.success, get(t, .color_palette_overrides, @ptrCast(&overrides)));
+    for (overrides) |entry| try testing.expect(!entry);
 }
 
 test "get color_palette_default vs current" {
