@@ -343,6 +343,7 @@ const Effects = struct {
     write_pty: ?WritePtyFn = null,
     bell: ?BellFn = null,
     color_scheme: ?ColorSchemeFn = null,
+    color_query: ?ColorQueryFn = null,
     desktop_notification: ?DesktopNotificationFn = null,
     device_attributes_cb: ?DeviceAttributesFn = null,
     enquiry: ?EnquiryFn = null,
@@ -377,6 +378,27 @@ const Effects = struct {
     /// Returns true and fills out_scheme if a color scheme is available,
     /// or returns false to silently ignore the query.
     pub const ColorSchemeFn = *const fn (Terminal, ?*anyopaque, *device_status.ColorScheme) callconv(lib.calling_conv) bool;
+
+    /// Palette slots 0..255, foreground 256, background 257, cursor 258.
+    pub const ColorQueryFn = *const fn (Terminal, ?*anyopaque, u16, bool, bool, *color.RGB.C) callconv(lib.calling_conv) bool;
+
+    fn colorQueryTrampoline(handler: *Handler, target: @import("../osc/parsers/color.zig").Target, is_kitty: bool, terminator: @import("../osc.zig").Terminator) ?color.RGB {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.color_query orelse return null;
+        const slot: u16 = switch (target) {
+            .palette => |index| index,
+            .dynamic => |value| switch (value) {
+                .foreground => 256,
+                .background => 257,
+                .cursor => 258,
+                else => return null,
+            },
+            .special => return null,
+        };
+        var result: color.RGB.C = undefined;
+        if (!func(@ptrCast(wrapper), wrapper.effects.userdata, slot, is_kitty, terminator == .bel, &result)) return null;
+        return .{ .r = result.r, .g = result.g, .b = result.b };
+    }
 
     /// C function pointer type for the enquiry callback.
     /// Returns the response bytes. The memory must remain valid
@@ -1485,6 +1507,7 @@ pub const Option = enum(c_int) {
     xt_checksum_extension = 45,
     program_status = 46,
     resize_window = 47,
+    color_query = 48,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1493,6 +1516,7 @@ pub const Option = enum(c_int) {
             .write_pty => ?Effects.WritePtyFn,
             .bell => ?Effects.BellFn,
             .color_scheme => ?Effects.ColorSchemeFn,
+            .color_query => ?Effects.ColorQueryFn,
             .desktop_notification => ?Effects.DesktopNotificationFn,
             .device_attributes => ?Effects.DeviceAttributesFn,
             .enquiry => ?Effects.EnquiryFn,
@@ -1571,6 +1595,10 @@ fn setTyped(
         .write_pty => wrapper.effects.write_pty = value,
         .bell => wrapper.effects.bell = value,
         .color_scheme => wrapper.effects.color_scheme = value,
+        .color_query => {
+            wrapper.effects.color_query = value;
+            wrapper.stream.handler.effects.color_query = if (value != null) &Effects.colorQueryTrampoline else null;
+        },
         .desktop_notification => wrapper.effects.desktop_notification = value,
         .device_attributes => wrapper.effects.device_attributes_cb = value,
         .enquiry => wrapper.effects.enquiry = value,
@@ -7978,4 +8006,61 @@ test "input state getters follow active protocols" {
     try testing.expect(!modify);
     try testing.expectEqual(mouse.Event.none, tracking);
     try testing.expectEqual(mouse.Format.x10, format);
+}
+
+test "colour query callback resolves or suppresses native replies" {
+    var terminal: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &terminal, 10, 3));
+    defer free(terminal);
+    const S = struct {
+        answer: bool = false,
+        slots: [4]u16 = undefined,
+        count: usize = 0,
+        bytes: [128]u8 = undefined,
+        len: usize = 0,
+        kitty_seen: bool = false,
+        bell_seen: bool = false,
+        fn query(_: Terminal, ud: ?*anyopaque, slot: u16, is_kitty: bool, bell: bool, out: *color.RGB.C) callconv(lib.calling_conv) bool {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.slots[self.count] = slot;
+            self.count += 1;
+            self.kitty_seen = is_kitty;
+            self.bell_seen = bell;
+            out.* = .{ .r = 18, .g = 52, .b = 86 };
+            return self.answer;
+        }
+        fn write(_: Terminal, ud: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            @memcpy(self.bytes[self.len..][0..len], bytes[0..len]);
+            self.len += len;
+        }
+    };
+    var state: S = .{};
+    try testing.expectEqual(Result.success, set(terminal, .userdata, @ptrCast(&state)));
+    try testing.expectEqual(Result.success, set(terminal, .write_pty, @ptrCast(&S.write)));
+    try testing.expectEqual(Result.success, set(terminal, .color_query, @ptrCast(&S.query)));
+    const queries = "\x1b]4;2;?\x1b\\\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\";
+    vt_write(terminal, queries, queries.len);
+    try testing.expectEqualSlices(u16, &.{ 2, 256, 257, 258 }, &state.slots);
+    try testing.expectEqual(@as(usize, 0), state.len);
+    state.count = 0;
+    state.answer = true;
+    const xterm_query = "\x1b]10;?\x07";
+    vt_write(terminal, xterm_query, xterm_query.len);
+    try testing.expect(!state.kitty_seen and state.bell_seen);
+    try testing.expectEqualStrings("\x1b]10;rgb:1212/3434/5656\x07", state.bytes[0..state.len]);
+    state.len = 0;
+    const kitty_query = "\x1b]21;foreground=?\x1b\\";
+    vt_write(terminal, kitty_query, kitty_query.len);
+    try testing.expect(state.kitty_seen and !state.bell_seen);
+    try testing.expectEqualStrings("\x1b]21;foreground=rgb:12/34/56\x1b\\", state.bytes[0..state.len]);
+    // Removing the callback restores Kitty's native unset-cursor response,
+    // even when xterm reporting would fall back to the foreground.
+    try testing.expectEqual(Result.success, set(terminal, .color_query, null));
+    var foreground: color.RGB.C = .{ .r = 18, .g = 52, .b = 86 };
+    try testing.expectEqual(Result.success, set(terminal, .color_foreground, @ptrCast(&foreground)));
+    state.len = 0;
+    const unset_cursor = "\x1b]21;cursor=?\x1b\\";
+    vt_write(terminal, unset_cursor, unset_cursor.len);
+    try testing.expectEqualStrings("\x1b]21;cursor=\x1b\\", state.bytes[0..state.len]);
 }

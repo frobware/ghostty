@@ -1892,6 +1892,18 @@ typedef void (*GhosttyTerminalResizeWindowFn)(
     const GhosttyTerminalResizeWindow* request);
 
 /**
+ * Resolve a colour query. Slots 0..255 are palette entries, 256 foreground,
+ * 257 background and 258 cursor. Return false to suppress the reply.
+ * The callback may read terminal data but must not feed VT input.
+ */
+typedef bool (*GhosttyTerminalColorQueryFn)(GhosttyTerminal terminal,
+                                           void *userdata,
+                                           uint16_t slot,
+                                           bool kitty,
+                                           bool bell_terminated,
+                                           GhosttyColorRgb *out_color);
+
+/**
  * Callback function type for color scheme queries (CSI ? 996 n).
  *
  * Called when the terminal receives a color scheme device status report
@@ -2780,6 +2792,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalResizeWindowFn
    */
   GHOSTTY_TERMINAL_OPT_RESIZE_WINDOW = 47,
+  /** Resolve OSC 4/10/11/12 and Kitty OSC 21 colour queries.
+   *  NULL uses native colours. Input type: GhosttyTerminalColorQueryFn. */
+  GHOSTTY_TERMINAL_OPT_COLOR_QUERY = 48,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 

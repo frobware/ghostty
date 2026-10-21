@@ -192,6 +192,10 @@ pub const Handler = struct {
         /// ignore the query.
         color_scheme: ?*const fn (*Handler) ?device_status.ColorScheme,
 
+        /// Resolve OSC colour queries. Null uses the terminal's colours;
+        /// a callback returning null suppresses the reply.
+        color_query: ?*const fn (*Handler, osc_color.Target, bool, osc.Terminator) ?color.RGB = null,
+
         /// Called in response to a device attributes query (CSI c,
         /// CSI > c, CSI = c). Returns the response to encode and
         /// write back to the pty.
@@ -2089,6 +2093,11 @@ pub const Handler = struct {
         }
     }
 
+    fn queryColor(self: *Handler, target: osc_color.Target, is_kitty: bool, terminator: osc.Terminator) ?color.RGB {
+        if (self.effects.color_query) |callback| return callback(self, target, is_kitty, terminator);
+        return self.terminal.colorForXterm(target);
+    }
+
     fn colorOperation(
         self: *Handler,
         requests: *const osc_color.List,
@@ -2162,7 +2171,7 @@ pub const Handler = struct {
 
                 .query => |target| {
                     if (self.effects.write_pty == null) continue;
-                    const c = self.terminal.colorForXterm(target) orelse continue;
+                    const c = self.queryColor(target, false, terminator) orelse continue;
                     try writeXtermColorReport(writer, target, c, terminator);
                 },
 
@@ -2250,7 +2259,16 @@ pub const Handler = struct {
                 },
                 .query => |key| {
                     if (self.effects.write_pty == null) continue;
-                    const c = self.terminal.colorForKitty(key) orelse {
+                    const c = (if (self.effects.color_query == null) self.terminal.colorForKitty(key) else switch (key) {
+                        .palette => |index| self.queryColor(.{ .palette = index }, true, request.terminator),
+                        .special => |special| switch (special) {
+                            .foreground => self.queryColor(.{ .dynamic = .foreground }, true, request.terminator),
+                            .background => self.queryColor(.{ .dynamic = .background }, true, request.terminator),
+                            .cursor => self.queryColor(.{ .dynamic = .cursor }, true, request.terminator),
+                            else => self.terminal.colorForKitty(key),
+                        },
+                    }) orelse {
+                        if (self.effects.color_query != null) continue;
                         if (!key.hasTerminalQueryColor()) continue;
                         if (response.written().len == 0) try writer.writeAll("\x1b]21");
                         try writer.print(";{f}=", .{key});
