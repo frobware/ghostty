@@ -3226,6 +3226,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyMouseFormat * (see mouse/encoder.h).
    */
   GHOSTTY_TERMINAL_DATA_MOUSE_FORMAT = 45,
+
+  /**
+   * Which palette entries have an application override from OSC 4. An override
+   * remains explicit even when its RGB equals the configured default. OSC 104
+   * clears the corresponding entries.
+   * Output type: bool[256] *
+   */
+  GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_OVERRIDES = 46,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
