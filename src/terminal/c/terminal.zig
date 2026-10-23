@@ -1508,6 +1508,7 @@ pub const Option = enum(c_int) {
     program_status = 46,
     resize_window = 47,
     color_query = 48,
+    deccolm = 49,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1544,6 +1545,7 @@ pub const Option = enum(c_int) {
             .title_report,
             .xt_checksum_report,
             .resize_pull_scrollback,
+            .deccolm,
             => ?*const bool,
             .kitty_image_medium_temp_file => ?*const lib.String,
             .apc_max_bytes,
@@ -1791,6 +1793,8 @@ fn setTyped(
         .clipboard_write_max_bytes => wrapper.stream.handler.kitty_clipboard_write_max_bytes =
             if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
         .resize_pull_scrollback => wrapper.terminal.flags.resize_pull_scrollback =
+            if (value) |ptr| ptr.* else true,
+        .deccolm => wrapper.terminal.flags.deccolm =
             if (value) |ptr| ptr.* else true,
         .xt_checksum_extension => {
             const bits = if (value) |ptr| ptr.* else 0;
@@ -5621,6 +5625,64 @@ test "set desktop_notification callback" {
     try testing.expectEqual(Result.success, set(t, .desktop_notification, null));
     vt_write(t, seq_c, seq_c.len);
     try testing.expectEqual(@as(usize, 2), S.count);
+}
+
+test "DECCOLM embedder policy precedes parsing and survives reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        6,
+    ));
+    defer free(t);
+
+    const disabled = false;
+    try testing.expectEqual(Result.success, set(t, .deccolm, &disabled));
+    for ([_][]const u8{
+        "\x1b[?40h\x1b[?3h",
+        "\x1b[?3l",
+        "\x1bc\x1b[?40h\x1b[?3h",
+        "\x1b[?3s\x1b[?3l\x1b[?3r",
+        "\x1b[!p\x1b[?40h\x1b[?3h",
+    }) |command| {
+        vt_write(t, command.ptr, command.len);
+        try testing.expectEqual(@as(size.CellCountInt, 20), t.?.terminal.cols);
+        try testing.expectEqual(@as(size.CellCountInt, 6), t.?.terminal.rows);
+        try testing.expect(!t.?.terminal.modes.get(.@"132_column"));
+    }
+
+    // Explicit geometry changes do not require enabling application resizes.
+    try testing.expectEqual(Result.success, resize(t, 30, 8, 0, 0));
+    const command = "\x1b[?40h\x1b[?3h";
+    vt_write(t, command, command.len);
+    try testing.expectEqual(@as(size.CellCountInt, 30), t.?.terminal.cols);
+    try testing.expectEqual(@as(size.CellCountInt, 8), t.?.terminal.rows);
+
+    // Resetting the option restores the existing native DECCOLM behavior.
+    try testing.expectEqual(Result.success, set(t, .deccolm, null));
+    vt_write(t, command, command.len);
+    try testing.expectEqual(@as(size.CellCountInt, 132), t.?.terminal.cols);
+}
+
+test "DECCOLM disabled preserves display and cursor" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        20,
+        6,
+    ));
+    defer free(t);
+    const disabled = false;
+    try testing.expectEqual(Result.success, set(t, .deccolm, &disabled));
+    const seq = "\x1b[2;4HX\x1b[?40h\x1b[?3h\x1b[?3lY";
+    vt_write(t, seq, seq.len);
+    const text = try t.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("\n   XY", text);
+    try testing.expectEqual(@as(size.CellCountInt, 5), t.?.terminal.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.?.terminal.screens.active.cursor.y);
 }
 
 test "set resize_window callback" {
