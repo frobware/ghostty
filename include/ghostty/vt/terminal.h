@@ -2550,6 +2550,23 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /** Resolve OSC 4/10/11/12 and Kitty OSC 21 colour queries.
    *  NULL uses native colours. Input type: GhosttyTerminalColorQueryFn. */
   GHOSTTY_TERMINAL_OPT_COLOR_QUERY = 48,
+
+  /**
+   * Allow DECCOLM (DEC mode 3) to resize the grid to 80 or 132 columns
+   * when application-controlled DEC mode 40 is enabled.
+   *
+   * Set to false when the embedder owns grid geometry. DECCOLM is then
+   * ignored before resizing, erasing the display, or moving the cursor.
+   * Application mode changes and resets cannot override this policy.
+   * Explicit ghostty_terminal_resize calls remain available.
+   *
+   * This is preserved across a full reset (RIS). A NULL value pointer
+   * resets to the built-in default of true. Changing the option does
+   * not resize the existing grid.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_DECCOLM = 49,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 

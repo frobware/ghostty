@@ -142,6 +142,10 @@ flags: packed struct {
     /// rather than terminal state so it is preserved across a full reset.
     resize_pull_scrollback: bool = true,
 
+    /// Whether DECCOLM may resize the grid. This is embedder configuration,
+    /// independent of application-controlled DEC mode 40, and survives RIS.
+    deccolm: bool = true,
+
     /// True if the terminal is in a password entry mode. This is set
     /// to true based on termios state. This is set
     /// to true based on termios state.
@@ -4041,17 +4045,19 @@ pub const DeccolmMode = enum(u1) {
 };
 
 /// DECCOLM changes the terminal width between 80 and 132 columns. This
-/// function call will do NOTHING unless `setDeccolmSupported` has been
-/// called with "true".
+/// function call does nothing unless embedder policy allows it and the
+/// application has enabled DEC mode 40.
 ///
 /// This breaks the expectation around modern terminals that they resize
 /// with the window. This will fix the grid at either 80 or 132 columns.
 /// The rows will continue to be variable.
 pub fn deccolm(self: *Terminal, alloc: Allocator, mode: DeccolmMode) !void {
+    // Embedder policy cannot be overridden by application modes or resets.
+    // Enforce it before resizing, clearing the display, or moving the cursor.
     // If DEC mode 40 isn't enabled, then this is ignored. We also make
     // sure that we don't have deccolm set because we want to fully ignore
     // set mode.
-    if (!self.modes.get(.enable_mode_3)) {
+    if (!self.flags.deccolm or !self.modes.get(.enable_mode_3)) {
         self.modes.set(.@"132_column", false);
         return;
     }
@@ -5070,6 +5076,7 @@ pub fn fullReset(self: *Terminal) void {
         // This is configuration based on the pty rather than terminal
         // state, so a terminal reset must not change it.
         .resize_pull_scrollback = self.flags.resize_pull_scrollback,
+        .deccolm = self.flags.deccolm,
 
         .xt_checksum = self.default_xt_checksum,
     };
