@@ -1697,7 +1697,10 @@ fn writeCell(
                 // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
                     const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
+                    if (head_cell.wide == .spacer_head) {
+                        head_cell.wide = .narrow;
+                        self.screens.active.cursor.page_pin.up(1).?.rowAndCell().row.dirty = true;
+                    }
                 }
             },
 
@@ -1722,7 +1725,10 @@ fn writeCell(
                 // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
                     const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
+                    if (head_cell.wide == .spacer_head) {
+                        head_cell.wide = .narrow;
+                        self.screens.active.cursor.page_pin.up(1).?.rowAndCell().row.dirty = true;
+                    }
                 }
             },
 
@@ -10413,6 +10419,25 @@ test "Terminal: eraseChars wide char wrap boundary conditions" {
         const unwrapped = try t.plainStringUnwrapped(alloc);
         defer testing.allocator.free(unwrapped);
         try testing.expectEqualStrings(".......     cde\n😀......", unwrapped);
+    }
+}
+
+test "Terminal: writeCell-spacer-dirty on wrapped wide overwrite" {
+    const alloc = testing.allocator;
+    for ([_]size.CellCountInt{ 1, 2 }) |col| {
+        var t = try init(testing.io, alloc, .{ .rows = 3, .cols = 5 });
+        defer t.deinit(alloc);
+
+        try t.printString("ABCD字");
+        t.setCursorPos(2, col);
+        t.clearDirty();
+        try t.print('X');
+
+        const head = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.narrow, head.cell.wide);
+        try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+        try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+        try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
     }
 }
 
