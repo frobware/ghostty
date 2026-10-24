@@ -4236,8 +4236,13 @@ pub fn increaseCapacity(
             const field_name = @tagName(tag);
             const Int = @FieldType(Capacity, field_name);
             const old = @field(cap, field_name);
+            const max: Int = if (comptime tag == .hyperlink_bytes)
+                Capacity.max_hyperlink_bytes
+            else
+                std.math.maxInt(Int);
 
             const new: Int = new: {
+                if (old >= max) return error.OutOfSpace;
                 // A dimension can be zero for pages with exact
                 // capacities (see compact). Doubling zero stays zero,
                 // which would break our guarantee that we always
@@ -4264,11 +4269,10 @@ pub fn increaseCapacity(
                     // Our final doubling would overflow since maxInt is
                     // 2^N - 1 for an unsignged int of N bits. So, if we overflow
                     // and we haven't used all the bits, use all the bits.
-                    if (old < std.math.maxInt(Int)) break :overflow std.math.maxInt(Int);
-                    return error.OutOfSpace;
+                    break :overflow max;
                 };
             };
-            @field(cap, field_name) = new;
+            @field(cap, field_name) = @min(new, max);
 
             // If our capacity exceeds the maximum page size, treat it
             // as an OutOfSpace because things like page splitting will
@@ -12410,6 +12414,38 @@ test "PageList increaseCapacity to increase hyperlinks" {
             }
         }
     }
+}
+
+test "PageList hyperlink byte capacity can hold a wide row of distinct links" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 4096, .rows = 1, .max_size = 0 });
+    defer s.deinit();
+
+    // Hyperlink IDs count entries, but the capacity field counts bytes.
+    // A valid row must not exhaust the byte field before it has one entry
+    // per cell, plus the cursor's pending hyperlink.
+    while (s.pages.first.?.page().hyperlink_set.layout.cap < 4098) {
+        _ = try s.increaseCapacity(s.pages.first.?, .hyperlink_bytes);
+    }
+    try testing.expect(s.pages.first.?.capacity().hyperlink_bytes > std.math.maxInt(u16));
+}
+
+test "PageList hyperlink byte capacity stops at the addressable ID table" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 2, .rows = 1, .max_size = 0 });
+    defer s.deinit();
+
+    while (s.pages.first.?.capacity().hyperlink_bytes < Capacity.max_hyperlink_bytes) {
+        _ = try s.increaseCapacity(s.pages.first.?, .hyperlink_bytes);
+    }
+    const node = s.pages.first.?;
+    const usage = s.memoryUsage();
+    try testing.expectError(error.OutOfSpace, s.increaseCapacity(node, .hyperlink_bytes));
+    try testing.expectEqual(node, s.pages.first.?);
+    try testing.expectEqual(usage, s.memoryUsage());
+    var oversized = node.capacity();
+    oversized.hyperlink_bytes = std.math.maxInt(size.HyperlinkBytesInt);
+    try testing.expectEqual(Page.layout(node.capacity()).total_size, Page.layout(oversized).total_size);
 }
 
 test "PageList increaseCapacity to increase string_bytes" {

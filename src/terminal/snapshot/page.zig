@@ -530,7 +530,8 @@ pub const Header = struct {
     /// Suggested capacity for the native non-default style set.
     style_capacity: u16,
 
-    /// Suggested native hyperlink storage capacity in bytes.
+    /// Suggested native hyperlink storage capacity in bytes. Saturates at
+    /// maxInt(u16); larger native pages derive their minimum from the counts.
     hyperlink_capacity_bytes: u16,
 
     /// Suggested native grapheme storage capacity in bytes.
@@ -582,7 +583,7 @@ pub const Header = struct {
             .style_count = @intCast(page.styles.count()),
             .hyperlink_count = @intCast(page.hyperlink_set.count()),
             .style_capacity = page.capacity.styles,
-            .hyperlink_capacity_bytes = page.capacity.hyperlink_bytes,
+            .hyperlink_capacity_bytes = @intCast(@min(page.capacity.hyperlink_bytes, std.math.maxInt(u16))),
             .grapheme_capacity_bytes = page.capacity.grapheme_bytes,
             .string_capacity_bytes = page.capacity.string_bytes,
         };
@@ -599,11 +600,24 @@ pub const Header = struct {
             return error.InvalidDimensions;
         }
 
+        // Version 1 has a 16-bit byte hint, while native hyperlink bytes
+        // can now exceed that. Keep the wire layout and reconstruct enough
+        // table and cell-map space from the declared dimensions/count when
+        // the hint saturates. These calculations allocate nothing; the full
+        // native layout still has to pass the page-size limit below.
+        const hyperlink_bytes = if (self.hyperlink_capacity_bytes == std.math.maxInt(u16)) bytes: {
+            const cells = @as(usize, self.columns) * self.rows;
+            break :bytes @max(self.hyperlink_capacity_bytes, TerminalPageCapacity.hyperlinkBytes(
+                self.hyperlink_count,
+                if (self.hyperlink_count == 0) 0 else cells,
+            ));
+        } else self.hyperlink_capacity_bytes;
+
         const cap: TerminalPageCapacity = .{
             .cols = self.columns,
             .rows = self.rows,
             .styles = self.style_capacity,
-            .hyperlink_bytes = self.hyperlink_capacity_bytes,
+            .hyperlink_bytes = @intCast(hyperlink_bytes),
             .grapheme_bytes = self.grapheme_capacity_bytes,
             .string_bytes = self.string_capacity_bytes,
         };
@@ -650,6 +664,60 @@ fn pageHyperlink(
 const test_page_fixture = test_fixture.parse(@embedFile("testdata/page-v1.hex"));
 const test_header_fixture = test_fixture.parse(@embedFile("testdata/page-header-v1.hex"));
 const test_empty_framed_page_fixture = test_fixture.parse(@embedFile("testdata/page-empty-record-v1.hex"));
+
+test "PAGE saturated hyperlink capacity round trip" {
+    const testing = std.testing;
+    var page = try TerminalPage.init(.{
+        .cols = 2048,
+        .rows = 1,
+        .hyperlink_bytes = 8192 * @sizeOf(terminal_hyperlink.Set.Item),
+        .string_bytes = 256 * 1024,
+    });
+    defer page.deinit();
+
+    {
+        page.pauseIntegrityChecks(true);
+        defer page.pauseIntegrityChecks(false);
+        for (0..2048) |x| {
+            var buf: [32]u8 = undefined;
+            const uri = try std.fmt.bufPrint(&buf, "https://example.com/{}", .{x});
+            const id = try page.insertHyperlink(.{ .id = .{ .implicit = @intCast(x) }, .uri = uri });
+            const rac = page.getRowAndCell(x, 0);
+            rac.cell.* = .init('x');
+            try page.setHyperlink(rac.row, rac.cell, id);
+        }
+    }
+    const header = Header.init(&page);
+    try testing.expectEqual(std.math.maxInt(u16), header.hyperlink_capacity_bytes);
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encodePayload(&page, &encoded.writer);
+    var reader: std.Io.Reader = .fixed(encoded.written());
+    var decoded = try decodePayload(&reader, testing.allocator);
+    defer decoded.deinit();
+    try testing.expectEqual(header, Header.init(&decoded));
+    try decoded.verifyIntegrity(testing.allocator);
+    for (0..2048) |x| {
+        const cell = decoded.getRowAndCell(x, 0).cell;
+        const id = decoded.lookupHyperlink(cell).?;
+        const entry = decoded.hyperlink_set.get(decoded.memory, id);
+        var buf: [32]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.fmt.bufPrint(&buf, "https://example.com/{}", .{x}),
+            entry.uri.slice(decoded.memory),
+        );
+    }
+
+    // A shared link may cover more cells than the narrow byte hint's map
+    // can hold, even when the distinct-entry count is small.
+    var shared = header;
+    shared.columns = 256;
+    shared.rows = 256;
+    shared.hyperlink_count = 1;
+    var shared_page = try TerminalPage.init(try shared.pageCapacity());
+    defer shared_page.deinit();
+    try testing.expect(shared_page.hyperlinkCapacity() >= 65536);
+}
 
 test "PAGE header golden encoding and decoding" {
     const header: Header = .{

@@ -31,6 +31,10 @@ pub const CellCountInt = u16;
 pub const StyleCountInt = CellCountInt;
 pub const HyperlinkCountInt = CellCountInt;
 
+// Hyperlink capacity is measured in bytes, not IDs. Each entry needs more
+// than one byte, so this must be wider than HyperlinkCountInt.
+pub const HyperlinkBytesInt = u32;
+
 // Total number of bytes that can be taken up by grapheme data and string
 // data. Both of these technically unlimited with malicious input, but
 // we choose a reasonable limit of 2^32 (4GB) per.

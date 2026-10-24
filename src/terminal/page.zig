@@ -782,22 +782,6 @@ pub const Page = struct {
             }
         }
 
-        // layout() requests `hyperlink_count * hyperlink_cell_multiplier`
-        // usable map entries. The map layout adds load-factor headroom and
-        // rounds the raw slot count to a power of two. We need enough
-        // hyperlink_bytes for that requested entry count to accommodate all
-        // hyperlink cells. This is unit tested.
-        const hyperlink_cap = cap: {
-            const hyperlink_count = id_set.count();
-            const hyperlink_set_cap = hyperlink.Set.capacityForCount(hyperlink_count);
-            const hyperlink_map_min = std.math.divCeil(
-                usize,
-                hyperlink_cells,
-                hyperlink_cell_multiplier,
-            ) catch 0;
-            break :cap @max(hyperlink_set_cap, hyperlink_map_min);
-        };
-
         // All the intCasts below are safe because we should have a
         // capacity strictly less than or equal to this page's capacity.
         return .{
@@ -805,7 +789,7 @@ pub const Page = struct {
             .rows = @intCast(y_end - y_start),
             .styles = @intCast(styles_cap),
             .grapheme_bytes = @intCast(grapheme_bytes),
-            .hyperlink_bytes = @intCast(hyperlink_cap * @sizeOf(hyperlink.Set.Item)),
+            .hyperlink_bytes = Capacity.hyperlinkBytes(id_set.count(), hyperlink_cells),
             .string_bytes = @intCast(string_bytes),
         };
     }
@@ -1846,7 +1830,7 @@ pub const Page = struct {
             const string_start = alignForward(usize, grapheme_map_end, StringAlloc.base_align.toByteUnits());
             const string_end = string_start + string_layout.total_size;
 
-            const hyperlink_count = @divFloor(cap.hyperlink_bytes, @sizeOf(hyperlink.Set.Item));
+            const hyperlink_count = @divFloor(@min(cap.hyperlink_bytes, Capacity.max_hyperlink_bytes), @sizeOf(hyperlink.Set.Item));
             const hyperlink_set_layout: hyperlink.Set.Layout = .init(@intCast(hyperlink_count));
             const hyperlink_set_start = alignForward(usize, string_end, hyperlink.Set.base_align.toByteUnits());
             const hyperlink_set_end = hyperlink_set_start + hyperlink_set_layout.total_size;
@@ -1921,13 +1905,29 @@ pub const Capacity = struct {
     /// amount of data used for hyperlinks in total is more than this because
     /// hyperlinks use string data as well as a small amount of lookup metadata.
     /// This number is a rough approximation.
-    hyperlink_bytes: size.HyperlinkCountInt = hyperlink_bytes_default,
+    hyperlink_bytes: size.HyperlinkBytesInt = hyperlink_bytes_default,
 
     /// Number of bytes to allocate for grapheme data.
     grapheme_bytes: size.GraphemeBytesInt = grapheme_bytes_default,
 
     /// Number of bytes to allocate for strings.
     string_bytes: size.StringBytesInt = string_bytes_default,
+
+    /// Enough bytes for the largest table addressable by hyperlink IDs.
+    /// Layout accepts larger hints, but growth stops here: extra bytes
+    /// cannot provide more usable IDs or cell-map entries.
+    pub const max_hyperlink_bytes: size.HyperlinkBytesInt =
+        (@as(size.HyperlinkBytesInt, std.math.maxInt(size.HyperlinkCountInt)) + 1) * @sizeOf(hyperlink.Set.Item);
+
+    /// Byte capacity for distinct entries and linked cells. Layout reserves
+    /// cell-map slots in proportion to the entry table; account for both.
+    /// Values beyond the native ID/map limit saturate at that limit.
+    pub fn hyperlinkBytes(count: usize, cells: usize) size.HyperlinkBytesInt {
+        const set_count = hyperlink.Set.capacityForCount(count);
+        const map_count = std.math.divCeil(usize, cells, hyperlink_cell_multiplier) catch unreachable;
+        const entries: usize = @min(@max(set_count, map_count), max_hyperlink_bytes / @sizeOf(hyperlink.Set.Item));
+        return @intCast(entries * @sizeOf(hyperlink.Set.Item));
+    }
 
     pub const Adjustment = struct {
         cols: ?size.CellCountInt = null,
@@ -2758,6 +2758,15 @@ test "Mask nested field path" {
 //     try testing.expectEqual(@as(usize, 524_288), total_size); // 512 KiB
 //     //const pages = total_size / std.heap.page_size_min;
 // }
+
+test "Page hyperlink byte sizing widens multiplication and saturates" {
+    try testing.expectEqual(0, Capacity.hyperlinkBytes(0, 0));
+    try testing.expectEqual(4096 * @sizeOf(hyperlink.Set.Item), Capacity.hyperlinkBytes(1, 65536));
+    try testing.expectEqual(
+        Capacity.max_hyperlink_bytes,
+        Capacity.hyperlinkBytes(std.math.maxInt(size.HyperlinkCountInt), std.math.maxInt(u32)),
+    );
+}
 
 test "Page.layout can take a maxed capacity" {
     // Our intention is for a maxed-out capacity to always fit
