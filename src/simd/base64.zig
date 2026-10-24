@@ -130,7 +130,21 @@ pub const Streaming = struct {
 
     /// Maximum decoded bytes one feed of input can produce.
     pub fn maxLen(self: *const Streaming, input: []const u8) usize {
-        return (self.carry_len + input.len) / 4 * 3;
+        const total = self.carry_len + input.len;
+        const size = total / 4 * 3;
+        // A completed terminal group produces fewer bytes when padded.
+        // Include carried padding so a split immediately before the last
+        // '=' has the same bound as an unsplit feed. Incomplete groups
+        // produce nothing until the remaining characters arrive.
+        if (total == 0 or total % 4 != 0) return size;
+        var pad: usize = 0;
+        if (input[input.len - 1] == '=') pad += 1;
+        const penultimate = if (input.len >= 2)
+            input[input.len - 2]
+        else
+            self.carry[self.carry_len - 1];
+        if (penultimate == '=') pad += 1;
+        return size -| pad;
     }
 
     /// Decode the complete groups of input (with any carried bytes

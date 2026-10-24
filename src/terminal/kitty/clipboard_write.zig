@@ -183,7 +183,19 @@ pub const WriteState = struct {
         // unused capacity. Invalid data aborts the transaction; per
         // the spec it must not be silently discarded "since that
         // turns corrupted data into apparently valid data".
-        try self.spool.ensureUnusedCapacity(alloc, self.decoder.maxLen(payload));
+        const remaining = self.max_size -| self.spool.items.len;
+        const decoded_max = self.decoder.maxLen(payload);
+        if (decoded_max > remaining) return error.TooLarge;
+        const needed = self.spool.items.len + decoded_max;
+        if (needed > self.spool.capacity) {
+            // ArrayList's ordinary geometric growth can exceed max_size.
+            // Admit the decode and clamp capacity before any allocation.
+            const grown = self.spool.capacity +| (self.spool.capacity / 2) +| 8;
+            try self.spool.ensureTotalCapacityPrecise(
+                alloc,
+                @min(self.max_size, @max(needed, grown)),
+            );
+        }
         const decoded = self.decoder.feed(
             payload,
             self.spool.unusedCapacitySlice(),
@@ -192,7 +204,6 @@ pub const WriteState = struct {
         // The limit covers all decoded data in the transaction. Going
         // over it aborts the entire write; partial clipboard contents
         // must never reach the embedder.
-        const remaining = self.max_size -| self.spool.items.len;
         if (decoded.len > remaining) return error.TooLarge;
         self.spool.items.len += decoded.len;
     }
@@ -608,6 +619,68 @@ test "write: default limit when unset" {
     var state: WriteState = try .init(alloc, &begin_meta, .{});
     defer state.deinit(alloc);
     try testing.expectEqual(@as(usize, max_write_size), state.max_size);
+}
+
+test "write: oversized data is refused before allocating the spool" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    for ([_]usize{ 0, 1, 2, 8 }) |limit| {
+        var state: WriteState = try .init(alloc, &.{ .op = .write }, .{ .max_size = limit });
+        defer state.deinit(alloc);
+        const meta: Metadata = .{ .op = .wdata, .mime = "text/plain" };
+        // Register the MIME entry before making every later allocation fail.
+        try state.data(alloc, &meta, "");
+        var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try testing.expectError(error.TooLarge, state.data(
+            failing.allocator(),
+            &meta,
+            "SGVsbG9Xb3JsZA==", // "HelloWorld"
+        ));
+        try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        try testing.expectEqual(@as(usize, 0), state.spool.capacity);
+    }
+}
+
+test "write: spool capacity stays within the limit at every split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const input = "SGVsbG9Xb3JsZA=="; // "HelloWorld"
+    for (0..input.len + 1) |split| {
+        var state: WriteState = try .init(alloc, &.{ .op = .write }, .{ .max_size = 10 });
+        defer state.deinit(alloc);
+        const meta: Metadata = .{ .op = .wdata, .mime = "text/plain" };
+        for ([_][]const u8{ input[0..split], input[split..] }) |part| {
+            try state.data(alloc, &meta, part);
+            try testing.expect(state.spool.capacity <= state.max_size);
+        }
+        const committed = try state.commit(alloc);
+        defer committed.deinit(alloc);
+        try testing.expectEqualStrings("HelloWorld", committed.contents[0].data);
+        const capacity = state.spool.capacity;
+        try testing.expectError(error.TooLarge, state.data(alloc, &meta, "YQ=="));
+        try testing.expectEqual(capacity, state.spool.capacity);
+    }
+}
+
+test "write: small exact limits include carried padding" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    for (0..13) |limit| {
+        const plain = "HelloWorld!!!"[0..limit];
+        var encoded: [20]u8 = undefined;
+        const input = std.base64.standard.Encoder.encode(&encoded, plain);
+        for (0..input.len + 1) |split| {
+            var state: WriteState = try .init(alloc, &.{ .op = .write }, .{ .max_size = limit });
+            defer state.deinit(alloc);
+            const meta: Metadata = .{ .op = .wdata, .mime = "text/plain" };
+            try state.data(alloc, &meta, input[0..split]);
+            try state.data(alloc, &meta, input[split..]);
+            try testing.expect(state.spool.capacity <= limit);
+            const committed = try state.commit(alloc);
+            defer committed.deinit(alloc);
+            try testing.expectEqualStrings(plain, committed.contents[0].data);
+        }
+    }
 }
 
 test "write: text over limit rejects transaction" {
