@@ -624,3 +624,93 @@ test "dnd: over-cap registration list never completes" {
         try testing.expect(it.next() == null);
     }
 }
+
+test "dnd: registration capacity stays within the MIME list limit" {
+    for ([_]usize{ 4093, 64 * 1024 }) |chunk_size| {
+        var h: Harness = .init();
+        defer h.deinit();
+        const payload = try testing.allocator.alloc(u8, chunk_size);
+        defer testing.allocator.free(payload);
+        @memset(payload, 'a');
+
+        var remaining: usize = dnd.max_mime_list_bytes;
+        while (remaining > 0) {
+            const count = @min(remaining, payload.len);
+            remaining -= count;
+            const event = try h.command("t=a:m=1", payload[0..count]);
+            try testing.expect(event == null);
+            try testing.expect(h.registered().drop.registered_mimes.capacity <= dnd.max_mime_list_bytes);
+        }
+        // Refuse an extra byte without growing or reporting completion.
+        const capacity = h.registered().drop.registered_mimes.capacity;
+        try testing.expect((try h.command("m=1", "x")) == null);
+        try testing.expectEqual(capacity, h.registered().drop.registered_mimes.capacity);
+        try testing.expectEqual(dnd.max_mime_list_bytes, h.registered().drop.registered_mimes.items.len);
+        // The final empty chunk completes the retained list, matching
+        // the existing protocol rule that only the over-cap chunk is dropped.
+        try testing.expectEqual(dnd.Event.registration, (try h.command("m=0", null)).?);
+        for (h.registered().drop.registered_mimes.items) |c| try testing.expectEqual(@as(u8, 'a'), c);
+        try testing.expectEqual(dnd.Event.registration, (try h.command("t=a", "text/plain")).?);
+        try testing.expectEqualStrings("text/plain", h.registered().drop.registered_mimes.items);
+        _ = try h.command("t=A", null);
+        try testing.expect(h.state == null);
+    }
+}
+
+test "dnd: acceptance capacity includes only one terminator beyond the MIME limit" {
+    for ([_]usize{ 4093, 64 * 1024 }) |chunk_size| {
+        var h: Harness = .init();
+        defer h.deinit();
+        _ = try h.command("t=a", "text/plain");
+        const payload = try testing.allocator.alloc(u8, chunk_size);
+        defer testing.allocator.free(payload);
+        @memset(payload, 'a');
+
+        var remaining: usize = dnd.max_mime_list_bytes;
+        while (remaining > 0) {
+            const count = @min(remaining, payload.len);
+            remaining -= count;
+            try testing.expect((try h.command("t=m:o=1:m=1", payload[0..count])) == null);
+            try testing.expect(h.registered().clientAccepted() == null);
+            try testing.expect(h.registered().drop.accepted_mimes.capacity <= dnd.max_mime_list_bytes + 1);
+        }
+        const capacity = h.registered().drop.accepted_mimes.capacity;
+        try testing.expect((try h.command("m=1", "x")) == null);
+        try testing.expectEqual(capacity, h.registered().drop.accepted_mimes.capacity);
+        try testing.expectEqual(dnd.max_mime_list_bytes, h.registered().drop.accepted_mimes.items.len);
+        try testing.expectEqual(dnd.Event.acceptance, (try h.command("m=0", null)).?);
+        const list = &h.registered().drop.accepted_mimes;
+        try testing.expect(list.capacity <= dnd.max_mime_list_bytes + 1);
+        try testing.expectEqual(dnd.max_mime_list_bytes + 1, list.items.len);
+        try testing.expectEqual(@as(u8, 0), list.items[list.items.len - 1]);
+        for (list.items[0 .. list.items.len - 1]) |c| try testing.expectEqual(@as(u8, 'a'), c);
+        try testing.expectEqual(dnd.Operation.copy, h.registered().clientAccepted().?);
+        // Conclusion releases acceptance storage while keeping registration.
+        _ = try h.command("t=r:o=1", null);
+        try testing.expectEqual(@as(usize, 0), list.capacity);
+        try testing.expectEqualStrings("text/plain", h.registered().drop.registered_mimes.items);
+        try testing.expectEqual(dnd.Event.acceptance, (try h.command("t=m:o=2", "image/png")).?);
+        try testing.expectEqualStrings("image/png\x00", list.items);
+        try testing.expectEqual(dnd.Operation.move, h.registered().clientAccepted().?);
+    }
+}
+
+test "dnd: oversized MIME lists are refused before allocating payload storage" {
+    var h: Harness = .init();
+    defer h.deinit();
+    _ = try h.command("t=a", null);
+    const payload = try testing.allocator.alloc(u8, dnd.max_mime_list_bytes + 1);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'a');
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    for ([_][]const u8{ "t=a", "t=m:o=1" }) |metadata| {
+        try testing.expect((try dnd.handleCommand(&h.state, failing.allocator(), &h.output.writer, .{
+            .metadata = metadata,
+            .payload = payload,
+            .terminator = .st,
+        })) == null);
+    }
+    try testing.expectEqual(@as(usize, 0), h.registered().drop.registered_mimes.capacity);
+    try testing.expectEqual(@as(usize, 0), h.registered().drop.accepted_mimes.capacity);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}

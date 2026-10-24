@@ -14,9 +14,24 @@ const Operations = command.Operations;
 
 const log = std.log.scoped(.kitty_dnd);
 
-/// Maximum accumulated size of a client-sent MIME list (the accepted
-/// list of a `t=m` status update). Matches kitty's MIME_LIST_SIZE_CAP.
+/// Maximum accumulated size and buffer capacity of a client-sent MIME
+/// list. Accepted lists may reserve one additional byte for the final
+/// NUL. Matches kitty's MIME_LIST_SIZE_CAP for payload bytes.
 pub const max_mime_list_bytes = 1024 * 1024;
+
+/// Grow geometrically without reserving beyond the admitted list limit.
+/// Callers check payload size before requesting capacity.
+fn ensureMimeCapacity(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    needed: usize,
+    limit: usize,
+) Allocator.Error!void {
+    assert(needed <= limit);
+    if (needed <= list.capacity) return;
+    const grown = list.capacity +| list.capacity / 2 +| 8;
+    try list.ensureTotalCapacityPrecise(alloc, @min(limit, @max(needed, grown)));
+}
 
 /// Process one OSC 72 command received from the client, writing any
 /// responses to the writer. Returns the state change the embedder may
@@ -465,8 +480,9 @@ pub const State = struct {
 
         // Matching kitty, an over-cap chunk is dropped and does not
         // complete the registration.
-        if (list.items.len + payload.len > max_mime_list_bytes) return null;
-        try list.appendSlice(alloc, payload);
+        if (payload.len > max_mime_list_bytes - list.items.len) return null;
+        try ensureMimeCapacity(list, alloc, list.items.len + payload.len, max_mime_list_bytes);
+        list.appendSliceAssumeCapacity(payload);
 
         return if (more) null else .registration;
     }
@@ -524,19 +540,27 @@ pub const State = struct {
         }
 
         if (payload.len > 0) {
-            // Matching kitty, an over-cap list stops accumulating and
-            // never finalizes, leaving the acceptance unanswered.
-            if (d.accepted_mimes.items.len + payload.len > max_mime_list_bytes) return null;
-            try d.accepted_mimes.appendSlice(alloc, payload);
+            // Matching kitty, an over-cap chunk is dropped without
+            // finalizing the acceptance.
+            const list = &d.accepted_mimes;
+            if (payload.len > max_mime_list_bytes - list.items.len) return null;
+            try ensureMimeCapacity(list, alloc, list.items.len + payload.len, max_mime_list_bytes + 1);
+            list.appendSliceAssumeCapacity(payload);
         }
 
         if (meta.more) return null;
         d.accept_in_progress = false;
         if (d.accepted_mimes.items.len > 0) {
+            try ensureMimeCapacity(
+                &d.accepted_mimes,
+                alloc,
+                d.accepted_mimes.items.len + 1,
+                max_mime_list_bytes + 1,
+            );
             for (d.accepted_mimes.items) |*c| {
                 if (c.* == ' ') c.* = 0;
             }
-            try d.accepted_mimes.append(alloc, 0);
+            d.accepted_mimes.appendAssumeCapacity(0);
         }
         return .acceptance;
     }
