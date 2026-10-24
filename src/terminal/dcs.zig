@@ -13,8 +13,9 @@ const log = std.log.scoped(.terminal_dcs);
 pub const Handler = struct {
     state: State = .{ .inactive = {} },
 
-    /// Maximum bytes any DCS command can take. This is to prevent
-    /// malicious input from causing us to allocate too much memory.
+    /// Maximum payload bytes any DCS command can take. XTGETTCAP also
+    /// caps its buffer capacity at this limit, including before termination.
+    /// This prevents malicious input from allocating too much memory.
     /// This is arbitrarily set to 1MB today, increase if needed.
     max_bytes: usize = 1024 * 1024,
 
@@ -85,7 +86,7 @@ pub const Handler = struct {
                         .state = .{
                             .xtgettcap = try .initCapacity(
                                 alloc,
-                                128, // Arbitrary choice
+                                @min(128, self.max_bytes),
                             ),
                         },
                     },
@@ -138,6 +139,19 @@ pub const Handler = struct {
                     return error.OutOfMemory;
                 }
 
+                // Allocating.Writer grows super-linearly by default. Grow
+                // explicitly so the allocation, not only the written length,
+                // respects the limit even for an unterminated command.
+                if (list.writer.end == list.writer.buffer.len) {
+                    const capacity = @min(
+                        self.max_bytes,
+                        @max(list.writer.buffer.len *| 2, 1),
+                    );
+                    list.writer.buffer = try list.allocator.realloc(
+                        list.writer.buffer,
+                        capacity,
+                    );
+                }
                 try list.writer.writeByte(byte);
             },
 
@@ -567,5 +581,68 @@ test "tmux enter and implicit exit" {
         defer cmd.deinit();
         try testing.expect(cmd == .tmux);
         try testing.expect(cmd.tmux == .exit);
+    }
+}
+
+test "XTGETTCAP parser allocation stays within its byte limit" {
+    const testing = std.testing;
+    for ([_]usize{ 0, 1, 127, 128, 129, 2049, 1024 * 1024 }) |limit| {
+        var h: Handler = .{ .max_bytes = limit };
+        defer h.deinit();
+        try testing.expect(h.hook(testing.allocator, .{ .intermediates = "+", .final = 'q' }) == null);
+        try testing.expect(h.state == .xtgettcap);
+        try testing.expect(h.state.xtgettcap.writer.buffer.len <= limit);
+        for (0..limit) |_| {
+            try testing.expect(h.put('A') == null);
+            try testing.expect(h.state == .xtgettcap);
+            try testing.expect(h.state.xtgettcap.writer.buffer.len <= limit);
+        }
+        var cmd = h.unhook().?;
+        defer cmd.deinit();
+        try testing.expectEqual(limit, cmd.xtgettcap.data.written().len);
+        for (cmd.xtgettcap.data.written()) |byte| try testing.expectEqual(@as(u8, 'A'), byte);
+    }
+}
+
+test "XTGETTCAP parser overflow discards storage and recovers" {
+    const testing = std.testing;
+    var h: Handler = .{ .max_bytes = 129 };
+    defer h.deinit();
+    try testing.expect(h.hook(testing.allocator, .{ .intermediates = "+", .final = 'q' }) == null);
+    for (0..h.max_bytes + 1) |_| try testing.expect(h.put('A') == null);
+    try testing.expect(h.state == .ignore);
+    for (0..4096) |_| try testing.expect(h.put('A') == null);
+    try testing.expect(h.unhook() == null);
+    try testing.expect(h.state == .inactive);
+    try testing.expect(h.hook(testing.allocator, .{ .intermediates = "+", .final = 'q' }) == null);
+    for ("544e") |byte| try testing.expect(h.put(byte) == null);
+    var cmd = h.unhook().?;
+    defer cmd.deinit();
+    try testing.expectEqualStrings("544E", cmd.xtgettcap.next().?);
+}
+
+test "XTGETTCAP parser allocation failure discards storage and recovers" {
+    const testing = std.testing;
+    // Fail the initial allocation, then the growth. Growth may remap in
+    // place, so refuse the remap too and fail the allocation it falls back to.
+    for ([_]testing.FailingAllocator.Config{
+        .{ .fail_index = 0 },
+        .{ .fail_index = 1, .resize_fail_index = 0 },
+    }) |config| {
+        var failing = testing.FailingAllocator.init(testing.allocator, config);
+        var h: Handler = .{ .max_bytes = 129 };
+        defer h.deinit();
+        try testing.expect(h.hook(failing.allocator(), .{ .intermediates = "+", .final = 'q' }) == null);
+        for (0..129) |_| try testing.expect(h.put('A') == null);
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(h.state == .ignore);
+        try testing.expect(h.unhook() == null);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        try testing.expect(h.hook(failing.allocator(), .{ .intermediates = "+", .final = 'q' }) == null);
+        for ("436f") |byte| try testing.expect(h.put(byte) == null);
+        var cmd = h.unhook().?;
+        defer cmd.deinit();
+        try testing.expectEqualStrings("436F", cmd.xtgettcap.next().?);
     }
 }
