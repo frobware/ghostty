@@ -1100,6 +1100,7 @@ pub const Handler = struct {
             .can_remember = false,
             .reply_ctx = &state,
             .reply_fn = &ClipboardReadState.reply,
+            .reply_size_fn = &ClipboardReadState.replySize,
         });
 
         // The program is waiting on us, so a callback that returned
@@ -1118,6 +1119,22 @@ pub const Handler = struct {
         terminator: osc.Terminator,
         replied: bool = false,
 
+        fn textData(result: clipboard.Read.Result) []const u8 {
+            return switch (result) {
+                .denied, .unsupported, .busy, .io_error => "",
+                .success => |s| for (s.contents) |c| {
+                    if (clipboard.isTextMime(c.mime)) break c.data;
+                } else "",
+            };
+        }
+
+        fn replySize(ctx: *anyopaque, result: clipboard.Read.Result) usize {
+            const self: *ClipboardReadState = @ptrCast(@alignCast(ctx));
+            return "\x1b]52;c;".len +|
+                kitty_clipboard.base64Size(textData(result).len) +|
+                self.terminator.string().len;
+        }
+
         fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
             const self: *ClipboardReadState = @ptrCast(@alignCast(ctx));
             if (self.replied) {
@@ -1126,14 +1143,7 @@ pub const Handler = struct {
             }
 
             // OSC 52 carries a single text value.
-            const data: []const u8 = switch (result) {
-                .denied, .unsupported, .busy, .io_error => "",
-                .success => |s| for (s.contents) |c| {
-                    if (clipboard.isTextMime(c.mime)) break c.data;
-                } else "",
-            };
-
-            self.respond(data) catch |err| {
+            self.respond(textData(result)) catch |err| {
                 // Leave replied unset so clipboardRead falls back to the
                 // empty reply.
                 log.warn("error replying to clipboard read err={}", .{err});
@@ -1284,6 +1294,7 @@ pub const Handler = struct {
             .can_remember = pw.len > 0,
             .reply_ctx = &state,
             .reply_fn = &KittyClipboardReadState.reply,
+            .reply_size_fn = &KittyClipboardReadState.replySize,
         });
 
         // The program is waiting on us, so a callback that returned
@@ -1307,6 +1318,50 @@ pub const Handler = struct {
         list: bool,
         terminator: osc.Terminator,
         replied: bool = false,
+
+        fn replySize(ctx: *anyopaque, result: clipboard.Read.Result) usize {
+            const self: *KittyClipboardReadState = @ptrCast(@alignCast(ctx));
+            const status: kitty_clipboard.Status = switch (result) {
+                .denied => .EPERM,
+                .unsupported => .ENOSYS,
+                .busy => .EBUSY,
+                .io_error => .EIO,
+                .success => |s| {
+                    var served: [kitty_clipboard.max_read_mimes]clipboard.Content = undefined;
+                    return self.successResponse(&s, &served).encodedSize();
+                },
+            };
+            return (kitty_clipboard.Response{
+                .op = .read,
+                .status = status,
+                .id = self.id,
+                .terminator = self.terminator,
+            }).encodedSize();
+        }
+
+        fn successResponse(
+            self: *const KittyClipboardReadState,
+            success: *const clipboard.Read.Result.Success,
+            served: *[kitty_clipboard.max_read_mimes]clipboard.Content,
+        ) kitty_clipboard.ReadSuccess {
+            var len: usize = 0;
+            for (self.mimes) |mime| {
+                for (success.contents) |content| {
+                    if (!std.mem.eql(u8, content.mime, mime)) continue;
+                    served[len] = content;
+                    len += 1;
+                    break;
+                }
+            }
+            return .{
+                .primary = self.primary,
+                .id = self.id,
+                .list = self.list,
+                .available = success.available,
+                .contents = served[0..len],
+                .terminator = self.terminator,
+            };
+        }
 
         fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
             const self: *KittyClipboardReadState = @ptrCast(@alignCast(ctx));
@@ -1367,15 +1422,7 @@ pub const Handler = struct {
             if (handler.effects.write_pty == null) return;
 
             var served_buf: [kitty_clipboard.max_read_mimes]clipboard.Content = undefined;
-            var served_len: usize = 0;
-            for (self.mimes) |mime| {
-                for (success.contents) |content| {
-                    if (!std.mem.eql(u8, content.mime, mime)) continue;
-                    served_buf[served_len] = content;
-                    served_len += 1;
-                    break;
-                }
-            }
+            const response = self.successResponse(success, &served_buf);
 
             // Status packets fit on the stack; DATA packets carry the
             // clipboard contents and fall back to the heap.
@@ -1384,14 +1431,7 @@ pub const Handler = struct {
             const alloc = stack.allocator();
             var aw: std.Io.Writer.Allocating = .init(alloc);
             defer aw.deinit();
-            try (kitty_clipboard.ReadSuccess{
-                .primary = self.primary,
-                .id = self.id,
-                .list = self.list,
-                .available = success.available,
-                .contents = served_buf[0..served_len],
-                .terminator = self.terminator,
-            }).encode(&aw.writer);
+            try response.encode(&aw.writer);
 
             const written = try aw.toOwnedSliceSentinel(0);
             defer alloc.free(written);

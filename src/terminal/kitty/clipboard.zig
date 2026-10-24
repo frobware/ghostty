@@ -66,6 +66,7 @@ pub const max_write_mimes = write.max_write_mimes;
 pub const max_write_aliases = write.max_write_aliases;
 
 pub const Response = response.Response;
+pub const base64Size = response.base64Size;
 pub const ReadSuccess = response.ReadSuccess;
 pub const PasteEvent = response.PasteEvent;
 pub const read_chunk_size = response.read_chunk_size;

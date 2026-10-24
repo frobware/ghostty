@@ -165,12 +165,17 @@ pub const ClipboardRead = extern struct {
     /// Terminal-owned reply state; opaque to the embedder.
     ctx: *const anyopaque,
     reply: ClipboardReadReplyFn,
+    reply_size: ClipboardReadSizeFn,
 };
 
 /// C function pointer type for replying to a clipboard read.
 ///
 /// C: GhosttyClipboardReadReplyFn
 pub const ClipboardReadReplyFn = *const fn (*const ClipboardRead, *const ClipboardReadReply) callconv(lib.calling_conv) void;
+
+/// C function pointer type for measuring a clipboard reply before encoding.
+/// C: GhosttyClipboardReadSizeFn
+pub const ClipboardReadSizeFn = *const fn (*const ClipboardRead, *const ClipboardReadReply) callconv(lib.calling_conv) usize;
 
 /// A request to show a desktop notification.
 ///
@@ -596,6 +601,7 @@ const Effects = struct {
             .can_remember = read.can_remember,
             .ctx = &ctx,
             .reply = &clipboardReadReplyTrampoline,
+            .reply_size = &clipboardReadSizeTrampoline,
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
     }
@@ -604,14 +610,32 @@ const Effects = struct {
         request: *const ClipboardRead,
         reply: *const ClipboardReadReply,
     ) callconv(lib.calling_conv) void {
+        clipboardReadResult(request, reply, false);
+    }
+
+    fn clipboardReadSizeTrampoline(
+        request: *const ClipboardRead,
+        reply: *const ClipboardReadReply,
+    ) callconv(lib.calling_conv) usize {
+        return clipboardReadResult(request, reply, true);
+    }
+
+    fn clipboardReadResult(
+        request: *const ClipboardRead,
+        reply: *const ClipboardReadReply,
+        comptime measure: bool,
+    ) if (measure) usize else void {
         const ctx: *const ClipboardReadCtx = @ptrCast(@alignCast(request.ctx));
         const read = ctx.read;
-        switch (reply.result) {
-            .success => {},
-            .denied => return read.reply(.denied),
-            .busy => return read.reply(.busy),
-            .io_error => return read.reply(.io_error),
-            .unsupported, _ => return read.reply(.unsupported),
+        const failure: ?clipboard.Read.Result = switch (reply.result) {
+            .success => null,
+            .denied => .denied,
+            .busy => .busy,
+            .io_error => .io_error,
+            .unsupported, _ => .unsupported,
+        };
+        if (failure) |result| {
+            return if (measure) read.replySize(result) else read.reply(result);
         }
 
         const c_contents: []const ClipboardContent = if (reply.contents) |ptr|
@@ -632,7 +656,7 @@ const Effects = struct {
         const alloc = sfa.allocator();
         const contents = alloc.alloc(clipboard.Content, c_contents.len) catch {
             log.warn("out of memory converting clipboard read reply", .{});
-            return;
+            return if (measure) std.math.maxInt(usize) else {};
         };
         defer alloc.free(contents);
         for (contents, c_contents) |*content, c_content| {
@@ -643,18 +667,19 @@ const Effects = struct {
         }
         const available = alloc.alloc([]const u8, c_available.len) catch {
             log.warn("out of memory converting clipboard read reply", .{});
-            return;
+            return if (measure) std.math.maxInt(usize) else {};
         };
         defer alloc.free(available);
         for (available, c_available) |*mime, c_mime| {
             mime.* = c_mime.ptr[0..c_mime.len];
         }
 
-        read.reply(.{ .success = .{
+        const result: clipboard.Read.Result = .{ .success = .{
             .contents = contents,
             .available = available,
             .remember = reply.remember,
-        } });
+        } };
+        return if (measure) read.replySize(result) else read.reply(result);
     }
 
     fn desktopNotificationTrampoline(
@@ -6742,6 +6767,74 @@ test "set clipboard write max bytes" {
     try testing.expectEqual(Result.success, set(t, .clipboard_write_max_bytes, null));
     try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
     try testing.expectEqual(@as(usize, kitty_clipboard.max_write_size), max);
+}
+
+test "clipboard reply size preflight matches native replies without answering" {
+    const S = struct {
+        var result: clipboard.Read.Status = .success;
+        var data_len: usize = 0;
+        var measured: usize = 0;
+        var total: usize = 0;
+        var writes: usize = 0;
+        var pure: bool = true;
+        const data: [4097]u8 = @splat('x');
+
+        fn writePty(_: Terminal, _: ?*anyopaque, _: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            total += len;
+            writes += 1;
+        }
+
+        fn clipboardRead(_: Terminal, _: ?*anyopaque, request: *const ClipboardRead) callconv(lib.calling_conv) void {
+            const mime: []const u8 = "text/plain";
+            const contents = [_]ClipboardContent{.{
+                .mime = .init(mime),
+                .data = .init(data[0..data_len]),
+            }};
+            const available = [_]lib.String{.init(mime)};
+            const response: ClipboardReadReply = .{
+                .size = @sizeOf(ClipboardReadReply),
+                .result = result,
+                .contents = &contents,
+                .contents_len = contents.len,
+                .available = &available,
+                .available_len = available.len,
+                .remember = false,
+            };
+            measured = request.reply_size(request, &response);
+            pure = pure and writes == 0 and
+                measured == request.reply_size(request, &response);
+            request.reply(request, &response);
+        }
+    };
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 6));
+    defer free(t);
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, @ptrCast(&S.clipboardRead)));
+    const long_id: [512]u8 = @splat('x');
+    for ([_][]const u8{
+        "\x1b]52;c;?\x07",
+        "\x1b]52;p;?\x1b\\",
+        "\x1b]5522;type=read;dGV4dC9wbGFpbg==\x07",
+        "\x1b]5522;type=read;dGV4dC9wbGFpbiAu\x1b\\",
+        "\x1b]5522;type=read;aW1hZ2UvcG5n\x1b\\",
+        "\x1b]5522;type=read;Lg==\x1b\\",
+        "\x1b]5522;type=read:loc=primary:id=" ++ long_id ++ ";dGV4dC9wbGFpbiB0ZXh0L3BsYWlu\x1b\\",
+    }) |query| {
+        for ([_]clipboard.Read.Status{ .success, .denied, .unsupported, .busy, .io_error }) |result| {
+            for ([_]usize{ 0, 1, 2, 4095, 4096, 4097 }) |len| {
+                S.result = result;
+                S.data_len = len;
+                S.total = 0;
+                S.writes = 0;
+                vt_write(t, query.ptr, query.len);
+                try testing.expect(S.pure);
+                try testing.expectEqual(@as(usize, 1), S.writes);
+                try testing.expectEqual(S.total, S.measured);
+            }
+        }
+    }
 }
 
 test "set clipboard_read callback" {

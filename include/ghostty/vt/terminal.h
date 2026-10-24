@@ -1212,6 +1212,18 @@ typedef void (*GhosttyClipboardReadReplyFn)(
     const GhosttyClipboardReadReply* reply);
 
 /**
+ * Measure the complete encoded reply without reading representation data or
+ * answering the request. May be called repeatedly during the read callback.
+ * Returns SIZE_MAX if the size cannot be represented or measured. The reply
+ * memory is borrowed only for this call; normal protocol filtering applies.
+ *
+ * @ingroup terminal
+ */
+typedef size_t (*GhosttyClipboardReadSizeFn)(
+    const GhosttyClipboardRead* read,
+    const GhosttyClipboardReadReply* reply);
+
+/**
  * A synchronous request to read clipboard contents.
  *
  * This is a sized struct. The callback must only access fields present in the
@@ -1279,6 +1291,9 @@ struct GhosttyClipboardRead {
 
   /** Answer the read; see the struct documentation. */
   GhosttyClipboardReadReplyFn reply;
+
+  /** Measure a reply before admission; does not answer or retain the read. */
+  GhosttyClipboardReadSizeFn reply_size;
 };
 
 /**

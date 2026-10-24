@@ -193,6 +193,16 @@ pub const Read = struct {
     reply_ctx: *anyopaque,
     reply_fn: *const fn (*anyopaque, Result) void,
 
+    /// Measure a complete protocol reply without constructing it or reading
+    /// representation data. Only valid during the same callback as reply_fn.
+    /// A missing measurer or unrepresentable size returns maxInt(usize).
+    reply_size_fn: ?*const fn (*anyopaque, Result) usize = null,
+
+    pub fn replySize(self: Read, result: Result) usize {
+        const measure = self.reply_size_fn orelse return std.math.maxInt(usize);
+        return measure(self.reply_ctx, result);
+    }
+
     /// Answer the read. May be called at most once; later calls are
     /// ignored. Result memory is borrowed only for the duration of this
     /// call.

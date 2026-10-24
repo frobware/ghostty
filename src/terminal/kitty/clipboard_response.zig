@@ -11,6 +11,12 @@ const Operation = protocol.Operation;
 const Status = protocol.Status;
 const Terminator = oscpkg.Terminator;
 
+/// Saturating size arithmetic lets admission reject even a reply whose
+/// base64 expansion cannot be represented by usize.
+pub fn base64Size(len: usize) usize {
+    return (len / 3) *| 4 +| (if (len % 3 > 0) @as(usize, 4) else 0);
+}
+
 /// Maximum raw (pre-base64) bytes per DATA packet in read responses.
 /// This is specified by the protocol.
 pub const read_chunk_size = 4096;
@@ -38,6 +44,16 @@ pub const Response = struct {
     /// emits no payload section at all (no ';').
     payload: []const u8 = "",
     terminator: Terminator = .st,
+
+    /// Size without reading or encoding the payload. Metadata is bounded by
+    /// the protocol and is counted through the same encoder as actual output.
+    pub fn encodedSize(self: *const Response) usize {
+        var count: std.Io.Writer.Discarding = .init(&.{});
+        self.encodeMetadata(&count.writer) catch unreachable;
+        var len: usize = @intCast(count.fullCount());
+        if (self.payload.len > 0) len = len +| 1 +| base64Size(self.payload.len);
+        return len +| self.terminator.string().len;
+    }
 
     /// Encode the response. Errors may result in partially written data
     /// so it is up to callers to buffer it if they need to.
@@ -101,6 +117,47 @@ pub const ReadSuccess = struct {
     contents: []const Content = &.{},
 
     terminator: Terminator = .st,
+
+    /// Measure the whole success sequence before allocating or encoding any
+    /// clipboard contents. Chunk counts are arithmetic, independent of data.
+    pub fn encodedSize(self: *const ReadSuccess) usize {
+        var len = (Response{
+            .op = .read,
+            .status = .OK,
+            .primary = self.primary,
+            .id = self.id,
+            .pw = self.pw,
+            .terminator = self.terminator,
+        }).encodedSize();
+        if (self.list) {
+            // The listing has a fixed 4096-byte raw bound, independent of
+            // the representation data being measured.
+            var count: std.Io.Writer.Discarding = .init(&.{});
+            self.encodeListing(&count.writer) catch unreachable;
+            len +|= @intCast(count.fullCount());
+        }
+        for (self.contents) |content| {
+            const header = (Response{
+                .op = .read,
+                .status = .DATA,
+                .id = self.id,
+                .mime = content.mime,
+                .pw = self.pw,
+                .terminator = self.terminator,
+            }).encodedSize() +| 1;
+            const full = content.data.len / read_chunk_size;
+            const tail = content.data.len % read_chunk_size;
+            len +|= full *| (header +| base64Size(read_chunk_size));
+            if (tail > 0) len = len +| header +| base64Size(tail);
+        }
+        return len +| (Response{
+            .op = .read,
+            .status = .DONE,
+            .id = self.id,
+            .pw = self.pw,
+            .terminator = self.terminator,
+        }).encodedSize();
+    }
 
     pub fn encode(
         self: *const ReadSuccess,
@@ -214,6 +271,59 @@ pub const PasteEvent = struct {
         }).encode(writer);
     }
 };
+
+test "clipboard reply size matches encoded chunking and metadata" {
+    const testing = std.testing;
+    var data: [2 * read_chunk_size + 1]u8 = @splat('x');
+    const long_id: [512]u8 = @splat('x');
+    var output: [32 * 1024]u8 = undefined;
+    for ([_]usize{ 0, 1, 2, 3, read_chunk_size - 1, read_chunk_size, read_chunk_size + 1, data.len }) |len| {
+        for ([_]Terminator{ .bel, .st }) |terminator| {
+            for ([_]bool{ false, true }) |list| {
+                const response: ReadSuccess = .{
+                    .primary = true,
+                    .id = &long_id,
+                    .pw = "password",
+                    .list = list,
+                    .available = &.{ "text/plain", "image/png" },
+                    .contents = &.{
+                        .{ .mime = "text/plain", .data = data[0..len] },
+                        .{ .mime = "image/png", .data = data[0..len] },
+                    },
+                    .terminator = terminator,
+                };
+                var writer: std.Io.Writer = .fixed(&output);
+                try response.encode(&writer);
+                try testing.expectEqual(writer.buffered().len, response.encodedSize());
+            }
+        }
+    }
+
+    // Listings drop types which exceed the fixed raw listing buffer. Size
+    // measurement must follow that same truncation, including empty lists.
+    const long_type: [read_chunk_size]u8 = @splat('x');
+    for ([_][]const []const u8{ &.{}, &.{ "text/plain", &long_type, "image/png" } }) |available| {
+        const response: ReadSuccess = .{ .list = true, .available = available };
+        var writer: std.Io.Writer = .fixed(&output);
+        try response.encode(&writer);
+        try testing.expectEqual(writer.buffered().len, response.encodedSize());
+    }
+}
+
+test "clipboard reply size saturates without reading representation data" {
+    const testing = std.testing;
+    // Deliberately unreadable: measuring only needs a representation length.
+    const data: []const u8 = @as([*]const u8, @ptrFromInt(1))[0..std.math.maxInt(usize)];
+    try testing.expectEqual(std.math.maxInt(usize), base64Size(data.len));
+    try testing.expectEqual(std.math.maxInt(usize), (Response{
+        .op = .read,
+        .status = .DATA,
+        .payload = data,
+    }).encodedSize());
+    try testing.expectEqual(std.math.maxInt(usize), (ReadSuccess{
+        .contents = &.{.{ .mime = "text/plain", .data = data }},
+    }).encodedSize());
+}
 
 test "response: basic status packet" {
     const testing = std.testing;
