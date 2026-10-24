@@ -1282,8 +1282,9 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
 
     if (!opts.reflow) {
         try self.resizeWithoutReflow(opts);
-        // Shrinking the active row count turns former active rows into
-        // scrollback even without reflow, which can cross the line limit.
+        // Shrinking the active area can expose whole historical pages,
+        // including enlarged pages which exceed the byte limit.
+        self.limits.enforce(self, .bytes);
         self.limits.enforce(self, .lines);
         return;
     }
@@ -1335,7 +1336,8 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
 
     // Column reflow can change the physical history row count, and a row
     // resize can move the active boundary. Both may expose whole old pages
-    // that are now eligible for line-limit pruning.
+    // that are now eligible for byte- or line-limit pruning.
+    self.limits.enforce(self, .bytes);
     self.limits.enforce(self, .lines);
 }
 
@@ -4023,6 +4025,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
         // Growing inside the last page moves the active boundary without
         // allocating; that alone can make the first page wholly historical.
+        self.limits.enforce(self, .bytes);
         self.limits.enforce(self, .lines);
         return null;
     }
@@ -4126,8 +4129,9 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
         page.assertIntegrity();
 
-        // Byte-limit recycling may leave history above the independent line
-        // limit, so enforce it after the recycled page becomes the new tail.
+        // Recycling may expose more eligible historical pages. Enforce both
+        // limits after the recycled page becomes the new active tail.
+        self.limits.enforce(self, .bytes);
         self.limits.enforce(self, .lines);
         return first;
     }
@@ -4147,8 +4151,9 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // Record the increased row count
     self.total_rows += 1;
 
-    // Appending a page can cross the line limit and can make the oldest
-    // active-boundary page wholly historical.
+    // Appending a page can make the oldest active-boundary page wholly
+    // historical, including an enlarged page above the byte limit.
+    self.limits.enforce(self, .bytes);
     self.limits.enforce(self, .lines);
     return next_node;
 }
@@ -11219,6 +11224,88 @@ test "PageList Cell screenPoint supports long scrollback" {
         .x = 0,
         .y = expected_y,
     } }, cell.screenPoint());
+}
+
+test "PageList byte limit prunes enlarged history when active boundary advances" {
+    const testing = std.testing;
+    const rows: size.CellCountInt = 3;
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = rows,
+        .max_size = 1,
+    });
+    defer s.deinit();
+
+    // Dense graphemes can enlarge the current page beyond the effective
+    // byte limit. Keep it while it contains any part of the active area.
+    while (s.page_size <= s.limits.max(.bytes)) {
+        _ = try s.increaseCapacity(s.pages.first.?, .grapheme_bytes);
+    }
+    const page_rows: usize = s.pages.first.?.capacity().rows;
+    try s.growRows(page_rows - rows);
+    _ = try s.grow();
+    try testing.expectEqual(@as(usize, 2), s.totalPages());
+    try testing.expectEqual(s.pages.first.?, s.getTopLeft(.active).node);
+    try testing.expect(s.page_size > s.limits.max(.bytes));
+
+    const old_pin = try s.trackPin(.{ .node = s.pages.first.? });
+    defer s.untrackPin(old_pin);
+    const active_pin = try s.trackPin(.{ .node = s.pages.last.? });
+    defer s.untrackPin(active_pin);
+    s.scroll(.{ .pin = old_pin.* });
+
+    _ = try s.grow();
+    try testing.expectEqual(@as(usize, 2), s.totalPages());
+    _ = try s.grow();
+
+    // Advancing within the new page makes the old page wholly historical.
+    // Byte pruning must happen here, without waiting for another allocation.
+    try testing.expectEqual(@as(usize, 1), s.totalPages());
+    try testing.expect(s.page_size <= s.limits.max(.bytes));
+    try testing.expectEqual(@as(usize, rows), s.total_rows);
+    try testing.expect(old_pin.garbage);
+    try testing.expectEqual(s.pages.first.?, old_pin.node);
+    try testing.expectEqual(s.pages.first.?, active_pin.node);
+    try testing.expect(!active_pin.garbage);
+    try testing.expect(s.viewport == .active);
+}
+
+test "PageList byte limit prunes enlarged history after row resize" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |reflow| {
+        var s = try init(testing.allocator, .{
+            .cols = 80,
+            .rows = 3,
+            .max_size = 1,
+        });
+        defer s.deinit();
+
+        while (s.page_size <= s.limits.max(.bytes)) {
+            _ = try s.increaseCapacity(s.pages.first.?, .grapheme_bytes);
+        }
+        const page_rows: usize = s.pages.first.?.capacity().rows;
+        try s.growRows(page_rows - 3 + 1);
+        try testing.expectEqual(@as(usize, 2), s.totalPages());
+        try testing.expectEqual(s.pages.first.?, s.getTopLeft(.active).node);
+
+        // Preserve the last row so shrinking moves the active boundary,
+        // rather than trimming a blank row from the tail.
+        const cell = s.getCell(.{ .active = .{ .y = 2 } }).?;
+        cell.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'A' } },
+        };
+        const active_pin = try s.trackPin(.{ .node = s.pages.last.? });
+        defer s.untrackPin(active_pin);
+
+        try s.resize(.{ .rows = 1, .reflow = reflow });
+        try testing.expectEqual(@as(usize, 1), s.totalPages());
+        try testing.expect(s.page_size <= s.limits.max(.bytes));
+        try testing.expectEqual(@as(usize, 1), s.total_rows);
+        try testing.expectEqual(s.pages.first.?, active_pin.node);
+        try testing.expect(!active_pin.garbage);
+        try testing.expectEqual(@as(u21, 'A'), s.getCell(.{ .active = .{} }).?.cell.codepoint());
+    }
 }
 
 test "PageList set max bytes prunes immediately and can be raised" {
