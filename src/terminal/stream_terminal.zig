@@ -737,7 +737,8 @@ pub const Handler = struct {
                 self.terminal.fullReset();
                 if (sync) self.renderHold(false);
 
-                // Full reset clears grants
+                // Full reset discards unfinished writes and session grants.
+                self.kittyClipboardAbort();
                 self.kitty_clipboard_grants.deinit(self.terminal.gpa());
                 self.kitty_clipboard_grants = .{};
 
@@ -5280,6 +5281,52 @@ test "kitty clipboard new write replaces in-flight transaction" {
         "\x1B]5522;type=write:status=DONE:id=new\x1B\\",
         S.responseSlice(),
     );
+}
+
+test "kitty clipboard RIS-aborts-write" {
+    for ([_][]const u8{ "b2xk", "b2" }) |payload| {
+        for ([_]bool{ false, true }) |fragmented| {
+            var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 6 });
+            defer t.deinit(testing.allocator);
+
+            const S = KittyClipboardCapture;
+            S.reset();
+            var handler: Handler = .init(&t);
+            handler.effects.write_pty = &S.writePty;
+            handler.effects.clipboard_write = &S.clipboardWrite;
+            var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+            defer s.deinit();
+
+            s.nextSlice("\x1B]5522;type=write:id=old\x1B\\");
+            s.nextSlice("\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;");
+            s.nextSlice(payload);
+            s.nextSlice("\x1B\\");
+            try testing.expect(s.handler.kitty_clipboard_write != null);
+
+            const tail = "\x1Bc" ++
+                "\x1B]5522;type=wdata\x1B\\";
+            if (fragmented) {
+                for (tail) |byte| s.nextSlice(&.{byte});
+            } else {
+                s.nextSlice(tail);
+            }
+            // Neither complete data nor an incomplete base64 group may
+            // survive reset and be committed or generate an error reply.
+            try testing.expectEqual(@as(usize, 0), S.write_count);
+            try testing.expectEqualStrings("", S.responseSlice());
+            try testing.expect(s.handler.kitty_clipboard_write == null);
+
+            s.nextSlice("\x1B]5522;type=write:id=new\x1B\\" ++
+                "\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bmV3\x1B\\" ++
+                "\x1B]5522;type=wdata\x1B\\");
+            try testing.expectEqual(@as(usize, 1), S.write_count);
+            try testing.expectEqualStrings("new", S.dataAt(0));
+            try testing.expectEqualStrings(
+                "\x1B]5522;type=write:status=DONE:id=new\x1B\\",
+                S.responseSlice(),
+            );
+        }
+    }
 }
 
 test "kitty clipboard invalid write packets abort with EINVAL" {
